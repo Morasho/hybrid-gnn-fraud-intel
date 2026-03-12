@@ -7,7 +7,7 @@ from sklearn.preprocessing import LabelEncoder
 
 # 1. Database Connection
 URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "securepassword123") # Update to match your password!
+AUTH = ("neo4j", "12345678") # Update to match your password!
 
 def extract_tabular_data():
     print("Extracting flat tabular data from Neo4j...")

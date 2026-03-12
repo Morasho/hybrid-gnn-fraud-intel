@@ -79,7 +79,7 @@ def train_and_evaluate():
     print("Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
     
-    # 4. Thesis Proof: Evaluation by Fraud Scenario
+    # 4. Our Reaseach Proposal Proof: Evaluation by Fraud Scenario
     print("\n--- PERFORMANCE BY FRAUD SCENARIO (The Thesis Proof) ---")
     test_indices = X_test.index
     test_df = df.iloc[test_indices].copy()

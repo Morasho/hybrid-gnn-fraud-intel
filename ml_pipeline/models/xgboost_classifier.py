@@ -52,7 +52,7 @@ def train_and_evaluate():
     df['sender_defaulted'] = df['sender_defaulted'].fillna(0)
 
     # Define our features (X) and our target label (y)
-    features = ['amount', 'tx_type_encoded', 'sender_age', 'sender_kyc_encoded', 'sender_defaulted']
+    features = ['amount', 'tx_type_encoded', 'sender_age', 'sender_kyc_encoded']
     X = df[features]
     y = df['label']
     
@@ -70,7 +70,7 @@ def train_and_evaluate():
     model.fit(X_train, y_train)
     
     # 3. Overall Evaluation
-    print("\n--- OVERALL MODEL PERFORMANCE ---")
+    print("\n OVERALL MODEL PERFORMANCE ")
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]
     
@@ -80,7 +80,7 @@ def train_and_evaluate():
     print(confusion_matrix(y_test, y_pred))
     
     # 4. Our Reaseach Proposal Proof: Evaluation by Fraud Scenario
-    print("\n--- PERFORMANCE BY FRAUD SCENARIO (The Thesis Proof) ---")
+    print("\n PERFORMANCE BY FRAUD SCENARIO (The Research Proposal Proof) ")
     test_indices = X_test.index
     test_df = df.iloc[test_indices].copy()
     test_df['predicted_fraud'] = y_pred

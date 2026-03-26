@@ -3,16 +3,15 @@ import pytest
 import torch
 import pandas as pd
 from neo4j import GraphDatabase
-from sklearn.preprocessing import OneHotEncoder
 
 #  Configuration 
 URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "12345678") # Update this to your actual Neo4j password!
+AUTH = ("neo4j", "12345678") # Your  password
 GRAPH_FILE = 'data/processed/hetero_graph.pt'
 
-# 1. Test Data Loader Function (Database Integrity)
+# 1. Test Database Integrity (Neo4j)
 def test_neo4j_connection_and_data_loader():
-    """Tests if Neo4j is running and successfully loaded the synthetic data."""
+    """Tests if Neo4j is running and successfully loaded the 100k transactions."""
     try:
         driver = GraphDatabase.driver(URI, auth=AUTH)
         with driver.session() as session:
@@ -30,38 +29,39 @@ def test_neo4j_connection_and_data_loader():
     except Exception as e:
         pytest.fail(f"Database connection or query failed: {e}")
 
-
-# 2. Test Feature Extraction Functions (Matrix Shapes)
-def test_feature_extraction_logic():
-    """Tests if our categorical text features correctly translate to mathematical matrices."""
-    # Mock some raw KYC data
-    mock_df = pd.DataFrame({'kyc_level': ['Tier_1', 'Tier_2', 'Tier_1', 'Tier_3']})
+# 2. Test Feature Engineering Logic (Pandas)
+def test_advanced_feature_logic():
+    """Tests if our new Pandas logic correctly catches SIM Swaps (Shared Devices)."""
+    # Mock a scenario: 3 different users logging into Device 1, and 1 user on Device 2
+    mock_df = pd.DataFrame({
+        'device_id': ['D_1', 'D_1', 'D_1', 'D_2'],
+        'sender_id': ['U_A', 'U_B', 'U_C', 'U_D']
+    })
     
-    encoder = OneHotEncoder(sparse_output=False)
-    encoded_matrix = encoder.fit_transform(mock_df[['kyc_level']])
+    # Run the exact logic from our feature_engineering.py script
+    device_counts = mock_df.groupby('device_id')['sender_id'].nunique().reset_index()
+    device_counts.rename(columns={'sender_id': 'num_accounts_linked'}, inplace=True)
+    mock_df = mock_df.merge(device_counts, on='device_id', how='left')
+    mock_df['shared_device_flag'] = (mock_df['num_accounts_linked'] > 2).astype(int)
     
-    # We expect 3 unique columns (Tier 1, 2, 3) and 4 rows of data
-    assert encoded_matrix.shape == (4, 3), f"Feature extraction failed. Expected shape (4, 3), got {encoded_matrix.shape}"
+    # Assert Device 1 is flagged as a SIM Swap (1) and Device 2 is Safe (0)
+    assert mock_df[mock_df['device_id'] == 'D_1']['shared_device_flag'].iloc[0] == 1, "Failed to flag shared device!"
+    assert mock_df[mock_df['device_id'] == 'D_2']['shared_device_flag'].iloc[0] == 0, "Falsely flagged a safe device!"
 
-
-# 3. Test Graph Construction Correctness (PyTorch Geometric Tensors)
+# 3. Test Graph Construction Correctness (PyTorch)
 def test_pytorch_heterodata_structure():
-    """Tests if the database was correctly converted into a PyTorch HeteroData object."""
-    # Ensure the pipeline actually saved the file
-    assert os.path.exists(GRAPH_FILE), f"Graph tensor file missing at {GRAPH_FILE}. Did you run graph_dataset.py?"
+    """Tests if the 13 engineered features were correctly compressed into PyTorch."""
+    assert os.path.exists(GRAPH_FILE), f"Graph tensor file missing at {GRAPH_FILE}."
     
     # Load the math
     data = torch.load(GRAPH_FILE, weights_only=False)
     
-    # Assert all node types made it into the neural network
-    expected_nodes = ['user', 'agent', 'device', 'institution']
-    for node in expected_nodes:
-        assert node in data.node_types, f"Graph Construction Error: Missing '{node}' nodes."
-        assert data[node].num_nodes > 0, f"Graph Construction Error: '{node}' tensor is empty."
-        
-    # Assert complex edges exist
-    assert ('user', 'p2p', 'user') in data.edge_types, "Missing User-to-User P2P edges."
-    assert ('user', 'uses', 'device') in data.edge_types, "Missing User-to-Device structural edges."
+    # Assert our condensed, highly-focused User nodes exist
+    assert 'user' in data.node_types, "Graph Construction Error: Missing 'user' nodes."
     
-    # Validate tensor formats (must be Float for neural network weights)
+    # Assert complex P2P edges exist
+    assert ('user', 'p2p', 'user') in data.edge_types, "Missing User-to-User P2P edges."
+    
+    # Validate tensor formats (Must be 13 columns for our new features, and float32)
+    assert data['user'].x.shape[1] == 13, f"Expected 13 node features, but got {data['user'].x.shape[1]}"
     assert data['user'].x.dtype == torch.float32, "User features must be float32 tensors."

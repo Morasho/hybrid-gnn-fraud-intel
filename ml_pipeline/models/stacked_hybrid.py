@@ -1,3 +1,5 @@
+import pickle
+import os
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
@@ -42,6 +44,12 @@ stacked_model = XGBClassifier(
     eval_metric='logloss'
 )
 stacked_model.fit(X_train, y_train)
+
+# Save the trained model for the API to use
+os.makedirs('models/saved', exist_ok=True)
+with open('models/saved/hybrid_xgboost.pkl', 'wb') as f:
+    pickle.dump(stacked_model, f)
+print("\n-> Brain Exported: Saved trained model to 'models/saved/hybrid_xgboost.pkl'")
 
 # 6. Evaluation: PURE ML PERFORMANCE (Threshold = 0.50)
 print("\n STACKED Model Detection Analysis ")

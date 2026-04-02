@@ -1,13 +1,25 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware # <-- Added for React Integration
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 import pandas as pd
 import xgboost as xgb
-import pickle #  saved my XGBoost model as a .pkl file
-import os #  Added to fix the pathing issue
+import pickle # saved my XGBoost model as a .pkl file
+import os # Added to fix the pathing issue
 
 #  1. INITIALIZE APP & CONNECTIONS 
 app = FastAPI(title="M-Pesa Fraud Intelligence API", version="1.0")
+
+# CORS MIDDLEWARE BLOCK 
+# This allows your React frontend (port 5173) to talk to FastAPI (port 8000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (POST, GET, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
 
 # Neo4j Connection (Update with your local credentials)
 URI = "neo4j://localhost:7687"

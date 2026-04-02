@@ -2,7 +2,7 @@ import pandas as pd
 from neo4j import GraphDatabase
 import time
 
-print("--- Initializing Neo4j Graph Population ---")
+print(" Initializing Neo4j Graph Population ")
 
 # 1. Update these with your actual Neo4j Desktop credentials!
 URI = "neo4j://localhost:7687"
@@ -41,12 +41,12 @@ def main():
     print(f"Loading data from {data_path}...")
     df = pd.read_csv(data_path)
     
-    # --- THE FIX STARTS HERE ---
+    
     # If transaction_id is missing from the CSV, auto-generate it (TXN_0, TXN_1, etc.)
     if 'transaction_id' not in df.columns:
         print("Auto-generating missing transaction IDs...")
         df['transaction_id'] = [f"TXN_{i}" for i in range(len(df))]
-    # --- THE FIX ENDS HERE ---
+
     
     # We only need the structural columns to build the graph shape
     graph_df = df[['transaction_id', 'sender_id', 'receiver_id', 'amount']]

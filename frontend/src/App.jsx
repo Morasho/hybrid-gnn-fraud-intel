@@ -1,5 +1,6 @@
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Layout from './components/Layout';
+import Transactions from './pages/Transactions';
 
 // Placeholder Pages (We will build these out in the next steps)
 const Dashboard = () => <div><h1 className="text-2xl font-bold mb-4">Dashboard Overview</h1><p>KPIs and Charts will go here.</p></div>;

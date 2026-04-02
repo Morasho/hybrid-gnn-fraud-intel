@@ -3,8 +3,8 @@ from pydantic import BaseModel
 from neo4j import GraphDatabase
 import pandas as pd
 import xgboost as xgb
-import pickle # Assuming you saved your XGBoost model as a .pkl file
-import os # <-- Added to fix the pathing issue
+import pickle #  saved my XGBoost model as a .pkl file
+import os #  Added to fix the pathing issue
 
 #  1. INITIALIZE APP & CONNECTIONS 
 app = FastAPI(title="M-Pesa Fraud Intelligence API", version="1.0")
@@ -67,20 +67,36 @@ async def predict_fraud(tx: TransactionRequest):
     """
     The Core Engine: 
     1. Receives tabular data. 
-    2. Queries Neo4j for network context. 
+    2. Queries Neo4j for network context and updates the graph. 
     3. Runs Hybrid Model. 
     4. Applies AI Analyst rules.
     """
-    # 1. Fetch live network features from Neo4j
-    # We ask the graph: "How many suspicious connections does this sender have right now?"
+    # 1. LIVE GRAPH UPDATE: Add the new transaction, then count the connections
     cypher_query = """
-    MATCH (s:User {user_id: $sender_id})-[r:SENT_MONEY]->(u:User)
+    // Ensure both users exist in the graph
+    MERGE (s:User {user_id: $sender_id})
+    MERGE (r:User {user_id: $receiver_id})
+    
+    // Draw the new transaction line (The Graph Update)
+    MERGE (s)-[tx:SENT_MONEY {transaction_id: $tx_id}]->(r)
+    SET tx.amount = toFloat($amount)
+    
+    // Calculate the updated network topology for the model
+    WITH s
+    MATCH (s)-[:SENT_MONEY]->(u:User)
     RETURN count(DISTINCT u) AS num_unique_recipients
     """
     
     try:
         with driver.session() as session:
-            result = session.run(cypher_query, sender_id=tx.sender_id)
+            # Execute the query with all necessary variables passed in
+            result = session.run(
+                cypher_query, 
+                sender_id=tx.sender_id,
+                receiver_id=tx.receiver_id,
+                tx_id=tx.transaction_id,
+                amount=tx.amount
+            )
             record = result.single()
             num_unique_recipients = record["num_unique_recipients"] if record else 0
             

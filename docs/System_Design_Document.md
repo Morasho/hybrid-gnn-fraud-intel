@@ -322,9 +322,46 @@ This confirms that combining GNN (for recall) and XGBoost (for precision) is the
 
 Successful tests -Test forward pass, Test embedding dimensions , Test loss computation ,Test inference on small dataset.
 
-## CARO Kitonga HAS PENDING WORK KINDLY REVISIT AND UPDATE THIS BIT.
+HYBRID INTERGRATION - stacked_hybrid.py
+We are combining GNN embeddings + tabular features, training a stacked hybrid model, and generating fraud risk scores.
+Hybrid Model (Stacking)
+
+Running:
+python ml_pipeline/models/stacked_hybrid.py
+
+Using probability stacking:
+GNN → network-based probabilities
+XGBoost → tabular predictions
+Hybrid → combined decision
+
+Result:Precision improving 10% → 24% ,Retaining strong network detection
+
+Upon Hyperparameter Tuning and Increasing penalty for missed fraud (recall-focused)  we get the following improvements.
+Improvements:
+Mule SIM Swap: 54.5% → 77.2%
+Fraud Rings: 56.4% → 69.2%
+Hence we can say stacked_hybrid has higher fraud detection rate
+
+AI FRAUD ANALYST(Tiered System)
+Running:
+python ml_pipeline/models/ai_fraud_analyst.py
+Tier 1: Hybrid model (high recall, many alerts)
+Tier 2: AI Analyst (filters false positives)
+
+Results:394 fraud detected (95.3% recall) ,2,194 false positives cleared (37%),Human review reduced: 6000+ → 3794
+
+TESTING.
+Running:
+python tests/test_hybrid_pipeline.py
+Validating: Embedding fusion , Pipeline execution ,Risk score correctness All tests should pass
+
+Manual Check
+Running:
+python tests/manual_sanity_check.py, Make sure Pipeline sanity check is passing.
+
 
 PHASE 3: INTEGRATION PHASE:
+
 backend + Model Integration.
 kindly run this :
 Install the required packages:

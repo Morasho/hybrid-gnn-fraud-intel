@@ -1,0 +1,81 @@
+
+# PYTHON & ENVIRONMENT
+
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+.pytest_cache/
+
+# Ignore virtual environment directories
+.env
+.env.*
+venv
+env
+venv/
+env/
+
+
+# JUPYTER & IDE
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+
+# DATA & MACHINE LEARNING ARTIFACTS
+
+# Ignore large data files (Crucial for GitHub limits)
+data/processed/
+data/raw/
+data/external/
+*.csv
+*.xlsx
+
+# Ignore model artifacts and weights
+models/saved/
+*.pt
+*.pth
+*.pkl
+
+# Ignore model checkpoints and logs
+logs/
+checkpoints/
+*.log
+
+
+# OS & BUILD FILES
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore build and distribution artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+
+#  REACT FRONTEND (NODE.JS)
+
+# Ignore the massive Node dependencies folder
+node_modules/
+frontend/node_modules/
+
+# Ignore frontend build outputs (Vite/React)
+frontend/dist/
+frontend/build/
+
+# Ignore npm debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

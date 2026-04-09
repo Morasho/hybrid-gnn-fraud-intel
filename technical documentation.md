@@ -6,7 +6,10 @@ Build a real-time fraud detection pipeline for mobile money ecosystems that comb
 **Core Hypothesis:** A hybrid GNN + XGBoost model outperforms pure tabular baselines on graph-based fraud detection while maintaining operational feasibility for real-time deployment.
 
 ## 2. Repository Layout (Current Implementation Status)
-- **`streaming/`**: Kafka-based transaction streaming (producer/consumer scripts - currently placeholder)
+- **`streaming/`**: ✅ **Kafka-based transaction streaming**
+  - `transaction_producer.py`: Synthetic M-Pesa transaction publisher to Kafka topics
+  - `graph_consumer.py`: Real-time transaction consumer with Neo4j + FastAPI integration
+- **`docker-compose.yml`**: ✅ **Kafka infrastructure orchestration** (Zookeeper + Kafka Broker)
 - **`ml_pipeline/data_gen/`**: Synthetic data generation with 5 fraud typologies
 - **`ml_pipeline/models/`**:
   - `baseline_xgboost.py`: Tabular-only baseline using engineered features
@@ -307,6 +310,148 @@ CREATE TABLE transactions (
 3. Creates User nodes and SENT_MONEY transaction edges with amounts
 4. Enables live graph visualization and real-time topology queries
 
+## 6.8 Kafka Streaming Implementation (`streaming/`)
+**Status:** ✅ **FULLY OPERATIONAL**
+
+### Architecture Overview
+Real-time transaction streaming pipeline with Kafka as the event backbone:
+1. **Kafka Broker** (port 9092) — Centralized event hub
+2. **Transaction Producer** — Publishes synthetic M-Pesa transactions every 2 seconds
+3. **Graph Consumer** — Subscribes to transaction stream, updates Neo4j graph, calls FastAPI `/predict` endpoint
+4. **Neo4j** — Live graph accumulates transactions with SENT_MONEY edges
+5. **FastAPI** — Fraud scoring triggered per transaction
+6. **SQLite** — Decision logging for audit trail
+
+### Docker Compose Infrastructure (`docker-compose.yml`)
+
+**Services:**
+- **Zookeeper** (image: confluentinc/cp-zookeeper:7.0.0)
+  - Port: 2181 (internal cluster coordination)
+  - Environment: ZOOKEEPER_CLIENT_PORT=2181
+  - Purpose: Manages broker leader election and partition metadata
+
+- **Kafka Broker** (image: confluentinc/cp-kafka:7.0.0)
+  - Port: 9092 (external client connections)
+  - Port: 29092 (internal broker communication)
+  - Environment: Auto-topic creation enabled (`AUTO_CREATE_TOPICS_ENABLE=true`)
+  - Broker ID: 1
+  - Zookeeper dependency: localhost:2181
+
+**Bootstrap:**
+```bash
+docker-compose up -d
+# Verify services running: docker-compose ps
+# Logs: docker-compose logs -f kafka
+```
+
+### Transaction Producer (`streaming/transaction_producer.py`)
+
+**Purpose:** Simulate real-time M-Pesa transaction stream
+
+**Functionality:**
+- Connects to Kafka broker at `localhost:9092`
+- Generates synthetic transactions every 2 seconds
+- Publishes to `transactions` topic (auto-created by Kafka)
+- Transaction schema:
+  ```
+  {
+    "transaction_id": "TXN_XXXXXX",
+    "timestamp": "2026-04-09T15:30:45.000Z",
+    "sender_id": "USER_1234",
+    "receiver_id": "USER_5678",
+    "amount": 15000.00,
+    "device_id": "DEVICE_ABC",
+    "agent_id": "AGENT_001"
+  }
+  ```
+
+**Execution:**
+```bash
+python streaming/transaction_producer.py
+# Output: "Sent transaction TXN_XXXXXX: sender_1234 → receiver_5678 (15000 KES)"
+```
+
+### Graph Consumer (`streaming/graph_consumer.py`)
+
+**Purpose:** Real-time integration of Kafka transactions with Neo4j and fraud detection
+
+**Dual Update Workflow:**
+
+1. **Neo4j Graph Update:**
+   - Consumes transaction from Kafka topic `transactions`
+   - Creates/updates User nodes if not exists (sender, receiver)
+   - Creates SENT_MONEY edge from sender → receiver with amount metadata
+   - Graph grows organically as transactions stream in
+   - Enables live network visualization via `/live-graph` endpoint
+
+2. **FastAPI Prediction Call:**
+   - Extracts transaction features from Kafka message
+   - Constructs feature vector compatible with hybrid_xgboost.pkl
+   - POSTs to `http://127.0.0.1:8000/predict` endpoint
+   - Receives risk_score, decision (AUTO_FREEZE, CONFIRMED_FRAUD, etc.), and reason
+   - Logs result to console with timestamp
+
+**Consumer Configuration:**
+- Kafka broker: `localhost:9092`
+- Topic: `transactions`
+- Group: `fraud-detection-group` (enables consumer offset tracking)
+- Auto-commit: Enabled (commits offset after successful prediction)
+
+**Execution:**
+```bash
+python streaming/graph_consumer.py
+# Output example:
+# Consumer started, listening to transactions topic...
+# [15:30:45] Received TXN_XXXXXX from sender_1234
+# Neo4j updated with SENT_MONEY edge
+# [15:30:46] FastAPI /predict called, risk_score=0.72, decision=REQUIRE_HUMAN
+```
+
+### Data Flow Integration
+
+```
+[Transaction Producer]
+         ↓
+   Kafka Topic: transactions
+         ↓
+[Graph Consumer]
+    ├→ Neo4j (graph updated)
+    └→ FastAPI /predict
+         ├→ Hybrid XGBoost inference
+         ├→ AI Analyst Tier 2 rules
+         └→ SQLite logging
+              ↓
+   [Dashboard refresh]
+```
+
+### Key Design Decisions
+
+| Aspect | Choice | Rationale |
+|--------|--------|----------|
+| **Message Format** | JSON strings | Human-readable, easy to debug, standard Kafka convention |
+| **Topic Name** | `transactions` | Semantic; matches M-Pesa use case |
+| **Consumer Group** | `fraud-detection-group` | Enables horizontal scaling; multiple consumers can process different partitions |
+| **Offset Commit** | Auto-commit enabled | Simplifies development; production should use manual commits for fine-grained control |
+| **Publish Frequency** | 2 seconds | Balances realistic streaming with manageable volume for testing |
+| **Error Handling** | Log & continue | Prevents cascading failures; failed predictions don't block Kafka consumption |
+
+### Integration with Existing Components
+
+**Backend (`backend/main.py`):** 
+- No changes needed; FastAPI listens for consumer POSTs to `/predict`
+- Consumer calls: `POST http://127.0.0.1:8000/predict`
+- Returns fraud decision to consumer for logging
+
+**Frontend (`frontend/`):**
+- No direct Kafka coupling; consumes via FastAPI and SQLite
+- Dashboard updates via `/dashboard-stats` endpoint (SQLite aggregations)
+- No latency requirement; 5-second refresh rate sufficient
+
+**Neo4j:**
+- Consumer updates graph in real-time
+- `/live-graph` endpoint returns latest topology for FraudNetwork page
+- Enables dynamic fraud ring visualization as transactions stream
+
 ## 7. End-to-End Pipeline Flow
 1. **Data Generation:** `generate_data.py` → `data/raw/p2p_transfers.csv`
 2. **Feature Engineering:** Graph construction and tabular feature extraction
@@ -315,23 +460,27 @@ CREATE TABLE transactions (
    - `evaluate_gnn.py` → GNN training → `hetero_graph.pt`, `gnn_probabilities.csv`
    - `stacked_hybrid.py` → Hybrid stacking → `hybrid_xgboost.pkl` (saved model)
 4. **Neo4j Population:** `populate_neo4j.py` → Batch-loads transactions into graph database
-5. **API Deployment:** `backend/main.py` (FastAPI)
+5. **Docker Infrastructure:** `docker-compose up -d` → Zookeeper + Kafka Broker startup
+6. **API Deployment:** `backend/main.py` (FastAPI)
    - Loads hybrid model from pickle
    - Initializes SQLite fraud_intel.db
    - Starts listening on http://127.0.0.1:8000
-6. **Frontend Deployment:** `frontend/` (React)
+7. **Kafka Streaming Pipeline:**
+   - `transaction_producer.py` → Publishes synthetic M-Pesa transactions every 2 seconds to Kafka topic
+   - `graph_consumer.py` → Subscribes to Kafka, updates Neo4j in real-time, calls FastAPI `/predict`
+8. **Frontend Deployment:** `frontend/` (React)
    - Starts Vite dev server
    - Connects to FastAPI backend
    - Displays real-time dashboard with Neo4j network visualization
-7. **Live Detection Pipeline:**
-   - User submits transaction via web form
-   - FastAPI `/predict` endpoint receives transaction
-   - Updates Neo4j graph and queries topology
-   - Hybrid XGBoost inference + Tier 2 AI Analyst rules
+9. **Live Detection Pipeline:**
+   - Kafka producer generates synthetic transaction
+   - Consumer receives transaction, updates Neo4j graph
+   - Consumer calls FastAPI `/predict` endpoint
+   - Hybrid XGBoost inference + Tier 2 AI Analyst rules applied
    - Response + decision logged to SQLite
    - Dashboard auto-refreshes with updated metrics
    - Analyst reviews alerts in queue and resolves via UI
-8. **Validation:** `test_gnn.py`, `test_hybrid_pipeline.py` → Architecture verification
+10. **Validation:** `test_gnn.py`, `test_hybrid_pipeline.py` → Architecture verification
 
 ## 8. Key Research Contributions
 - **Empirical Proof:** Quantified performance gains on graph fraud vs tabular baselines
@@ -352,8 +501,9 @@ CREATE TABLE transactions (
 - ✅ **Transaction prediction endpoint with hybrid model (COMPLETE)**
 - ✅ **Alerts queue management system (COMPLETE)**
 - ✅ **Dashboard analytics and KPI tracking (COMPLETE)**
-- ⏳ Kafka streaming implementation
-- ⏳ Docker orchestration final configuration
+- ✅ **Kafka streaming with real-time transaction producer/consumer (COMPLETE)**
+- ✅ **Docker Compose for Zookeeper + Kafka infrastructure (COMPLETE)**
+- ✅ **Full end-to-end streaming pipeline with Neo4j + FastAPI integration (COMPLETE)**
 
 ## 9.5 Recent Implementation Highlights (April 2026)
 
@@ -383,7 +533,17 @@ CREATE TABLE transactions (
 
 ## 10. How to Run (Current State)
 
-### Step 1: Activate Environment & Generate Data
+### Step 1: Start Kafka Infrastructure
+```bash
+# Verify Docker running
+docker-compose up -d
+
+# Verify services running
+docker-compose ps
+# Output: zookeeper RUNNING, kafka RUNNING
+```
+
+### Step 2: Activate Environment & Generate Data
 ```bash
 # Activate virtual environment
 & venv\Scripts\Activate.ps1
@@ -402,13 +562,13 @@ python ml_pipeline/models/stacked_hybrid.py   # Produces hybrid_xgboost.pkl
 python ml_pipeline/models/ai_fraud_analyst.py # Tier 2 analysis
 ```
 
-### Step 2: Load Data into Neo4j
+### Step 3: Load Data into Neo4j
 ```bash
 # Before running: Start Neo4j Desktop with credentials (uri: neo4j://localhost:7687, auth: neo4j/12345678)
 python populate_neo4j.py   # Bulk-loads transactions into Neo4j graph
 ```
 
-### Step 3: Start Backend API Server
+### Step 4: Start Backend API Server
 ```bash
 cd backend
 python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
@@ -416,30 +576,64 @@ python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 # Swagger docs: http://127.0.0.1:8000/docs
 ```
 
-### Step 4: Start Frontend React Dashboard
+### Step 5: Start Kafka Streaming Pipeline (2 terminals)
+```bash
+# Terminal A: Transaction Producer
+python streaming/transaction_producer.py
+# Output: "Sent transaction TXN_XXXXXX: ..." every 2 seconds
+
+# Terminal B: Graph Consumer
+python streaming/graph_consumer.py
+# Output: "Received TXN_XXXXXX from sender_1234..."
+#         "Neo4j updated with SENT_MONEY edge"
+#         "FastAPI /predict called, decision=..."
+```
+
+### Step 6: Start Frontend React Dashboard
 ```bash
 cd frontend
 npm install  # If first time
 npm run dev  # Starts Vite dev server (default: http://localhost:5173)
 ```
 
-### Step 5: Test the Full Stack
-**Option A: Use Transaction Form**
+### Step 7: Test the Full Stack
+**Option A: Live Streaming Transaction Detection**
+- Kafka producer auto-generates M-Pesa transactions
+- Consumer updates Neo4j graph + calls FastAPI in real-time
+- Navigate to http://localhost:5173/network → "LIVE" mode
+- Watch fraud network grow as transactions stream
+- Check Alerts queue for flagged transactions
+
+**Option B: Use Transaction Form** (sends individual transactions)
 - Navigate to http://localhost:5173/transactions
 - Fill form and submit
 - Observe risk score, decision, and AI reasoning
 - Check Neo4j graph updated in /network page
 
-**Option B: Use Alerts Queue**
-- Generate multiple transactions via form
+**Option C: Use Alerts Queue**
+- Transactions from Kafka producer appear in queue
 - Navigate to /alerts to see pending review queue
 - Approve/deny decisions persist to SQLite
 - Check /reports for compliance metrics
 
-**Option C: Use Live Network Visualization**
-- Navigate to /network → "LIVE" mode
-- Real-time fraud ring topology from Neo4j appears
-- Test case studies show example scam patterns
+**Option D: Monitor Kafka Pipeline**
+```bash
+# In separate terminal, watch Kafka messages
+docker exec -it <kafka_container_id> kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic transactions \
+  --from-beginning
+```
+
+### Full Stack Verification Checklist
+- ✅ Zookeeper + Kafka running: `docker-compose ps`
+- ✅ Neo4j graph has 100k+ nodes: Open Neo4j Desktop → query `MATCH (n) RETURN count(n)`
+- ✅ FastAPI responding: `curl http://127.0.0.1:8000/docs` → Swagger UI loads
+- ✅ Kafka producer generating: Check console output every 2 seconds
+- ✅ Kafka consumer consuming: Check consumer logs show "Received TXN_XXXXXX..."
+- ✅ Neo4j updating live: Query `MATCH (u)-[r:SENT_MONEY]->(v) RETURN count(r)` → count increasing
+- ✅ SQLite persisting: Check `backend/fraud_intel.db` → transactions table growing
+- ✅ Frontend displaying: http://localhost:5173 → Home dashboard shows live KPIs
 
 ### Automated Pipeline (Optional)
 ```bash
@@ -476,8 +670,11 @@ MODEL_PATH = os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl")
 ## 12. Known Limitations & Future Work
 
 ### Current Limitations
-- **Kafka Streaming:** Producer/consumer scripts are placeholders; real-time event streaming not yet wired
-- **Docker:** docker-compose.yml exists but is empty; full containerization pending
+- **Horizontal Scaling:** Current implementation runs on single machine; multi-broker Kafka cluster untested
+- **Consumer Error Handling:** Failed FastAPI predictions logged but not retried; no dead letter queue
+- **Topic Partitioning:** Single partition per topic; production should partition for parallel consumption
+- **Monitoring Dashboard:** No Kafka metrics in frontend; Kafka broker metrics not surfaced to UI
+- **Production Protocols:** Plain-text Kafka communication; production should use SSL/TLS
 - **Scalability:** Current implementation tested on single-machine setup; multi-instance deployment untested
 - **Authentication:** No authentication layer; API is open to localhost
 - **Frontend Deployment:** Vite used for development; production build and CDN deployment pending

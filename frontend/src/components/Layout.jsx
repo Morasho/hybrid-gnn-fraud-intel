@@ -1,6 +1,6 @@
 // src/components/Layout.jsx
 import { Link, useLocation } from 'react-router-dom';
-import { Shield, LayoutDashboard, Receipt, Network, Bell, FileText, Settings, User } from 'lucide-react';
+import { Shield, LayoutDashboard, Receipt, Network, Bell, BarChart3, FileText, Settings, User } from 'lucide-react';
 
 export default function Layout({ children }) {
   const location = useLocation();
@@ -10,6 +10,7 @@ export default function Layout({ children }) {
     { name: 'Transactions', path: '/transactions', icon: Receipt },
     { name: 'Fraud Network', path: '/network', icon: Network },
     { name: 'Alerts', path: '/alerts', icon: Bell },
+    { name: 'Models', path: '/models', icon: BarChart3 },
     { name: 'Reports', path: '/reports', icon: FileText },
     { name: 'Settings', path: '/settings', icon: Settings },
   ];

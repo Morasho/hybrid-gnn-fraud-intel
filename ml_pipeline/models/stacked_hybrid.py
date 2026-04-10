@@ -12,18 +12,37 @@ print("Group 15:(TIER ONE) STACKED HYBRID GNN-XGBoost Evaluation ")
 print("Loading Tabular features...")
 df = pd.read_csv('data/processed/final_model_data.csv')
 
-print("Loading GNN Probabilities (The Stacked Feature)...")
-probs_df = pd.read_csv('data/processed/gnn_probabilities.csv')
+print("Loading GNN Embeddings (The Stacked Feature)...")
+embeddings_df = pd.read_csv('data/processed/user_embeddings.csv')
 
-# 2. STACKING
-hybrid_df = pd.concat([df, probs_df], axis=1)
+# AUTO-DETECT EMBEDDINGS DIMENSIONS
+# Instead of hardcoding 64, we detect the number of embedding columns dynamically
+embedding_dim = len(embeddings_df.columns) - 1  # Subtract 1 for the 'user_id' column
+print(f"Auto-detected embedding dimensions: {embedding_dim}")
+
+# Add prefix to avoid column name collisions
+embeddings_df = embeddings_df.add_prefix('gnn_')
+
+# Merge the sender's GNN structural intelligence onto each transaction
+# The 'user_id' column is now 'gnn_user_id' due to the prefix
+hybrid_df = df.merge(
+    embeddings_df,
+    left_on='sender_id',
+    right_on='gnn_user_id',
+    how='left'
+)
+
+print(f"Stacked feature set dimensions: {embedding_dim} embedding features")
 
 # 3. Prepare for Machine Learning
 drop_cols = ['sender_id', 'receiver_id', 'timestamp', 'device_id', 'agent_id', 
-             'is_fraud', 'fraud_scenario']
+             'is_fraud', 'fraud_scenario', 'gnn_user_id']
 X = hybrid_df.drop(columns=drop_cols, errors='ignore')
 y = hybrid_df['is_fraud']
 scenarios = hybrid_df['fraud_scenario']
+
+print(f"Feature set shape: {X.shape}")
+print(f"Includes {embedding_dim} auto-detected GNN embedding dimensions")
 
 # 4. Split Data (Strict 42 Seed)
 X_train, X_test, y_train, y_test, scen_train, scen_test = train_test_split(

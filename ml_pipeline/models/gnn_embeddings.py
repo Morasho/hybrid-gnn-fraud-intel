@@ -4,8 +4,15 @@ from torch_geometric.nn import SAGEConv, to_hetero
 import torch_geometric.transforms as T
 import pandas as pd
 import os
+from config import get_model_config
 
 print(" Phase 2, Week 4: Graph Neural Network Training ")
+
+# Get auto-detected configuration
+config = get_model_config()
+embedding_dim = config['embedding_dim']
+print(f"Using auto-detected embedding dimension: {embedding_dim}")
+
 
 #  1. Load the Upgraded Tensors 
 GRAPH_PATH = 'data/processed/hetero_graph.pt'
@@ -58,8 +65,9 @@ class HybridGNN(torch.nn.Module):
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data = data.to(device)
 
-# Initialize model with 64-dimensional embeddings
-model = HybridGNN(hidden_channels=64).to(device)
+# Initialize model with auto-detected embedding dimensions
+print(f"Initializing GNN model with {embedding_dim}-dimensional embeddings...")
+model = HybridGNN(hidden_channels=embedding_dim).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
 # Handle the 2.8% Fraud Imbalance (CRUCIAL for real-world detection)
@@ -85,7 +93,7 @@ for epoch in range(1, 101):
         print(f'Epoch {epoch:03d}, Loss: {loss.item():.4f}')
 
 # 5. Extract and Save Embeddings
-print("\nExtracting 64-dimensional structural embeddings...")
+print(f"\nExtracting {embedding_dim}-dimensional structural embeddings...")
 model.eval()
 with torch.no_grad():
     final_embeddings = model.encoder(data.x_dict, data.edge_index_dict)

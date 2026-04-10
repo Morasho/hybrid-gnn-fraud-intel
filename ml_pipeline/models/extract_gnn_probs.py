@@ -2,8 +2,15 @@ import torch
 import pandas as pd
 import numpy as np
 from torch_geometric.nn import SAGEConv, to_hetero
+from config import get_model_config
 
 print(" Step 1: Probability Distillation (Extracting GNN Brain) ")
+
+# Get auto-detected configuration
+config = get_model_config()
+embedding_dim = config['embedding_dim']
+print(f"Using auto-detected embedding dimension: {embedding_dim}")
+
 
 # 1. Load Data
 data = torch.load('data/processed/hetero_graph.pt', weights_only=False)
@@ -56,8 +63,9 @@ train_idx = indices[:train_size]
 train_edges = all_edges[:, train_idx]
 train_labels = all_labels[train_idx]
 
-model = HybridGNN(hidden_channels=64).to(device)
+model = HybridGNN(hidden_channels=embedding_dim).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
 
 pos_weight = (len(train_labels) - train_labels.sum()) / train_labels.sum()
 criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)

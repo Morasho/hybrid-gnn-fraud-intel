@@ -3,8 +3,14 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report, roc_auc_score
 from torch_geometric.nn import SAGEConv, to_hetero
+from config import get_model_config
 
 print(" GNN Evaluation Script (On the 20% Test Set) ")
+
+# Get auto-detected configuration
+config = get_model_config()
+embedding_dim = config['embedding_dim']
+print(f"Using auto-detected embedding dimension: {embedding_dim}")
 
 # 1. Load the Exact Same Graph
 data = torch.load('data/processed/hetero_graph.pt', weights_only=False)
@@ -68,7 +74,7 @@ test_edges = all_edges[:, test_idx]
 test_labels = all_labels[test_idx]
 
 # 4. Initialize Model & Force it to pay attention to the 2.8% fraud cases
-model = HybridGNN(hidden_channels=64).to(device)
+model = HybridGNN(hidden_channels=embedding_dim).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
 num_neg = len(train_labels) - train_labels.sum()

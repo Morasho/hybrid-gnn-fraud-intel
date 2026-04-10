@@ -295,9 +295,246 @@ python streaming/graph_consumer.py
    - Analyst reviews alerts in queue and resolves via UI
 10. **Validation:** `test_gnn.py`, `test_hybrid_pipeline.py` → Architecture verification
 
+## 8. Phase 3 Implementation: Tasks 1-5 (COMPLETE ✅)
+
+### Task 1: File Upload Endpoint & Transaction Extraction ✅
+**Status:** COMPLETED - 7 comprehensive tests passing
+
+**Implementation:**
+- **Endpoint:** `POST /upload-transaction-file`
+- **File Formats:** CSV, PDF, DOCX, DOC
+- **Functionality:**
+  - Parses transaction files using pandas (CSV), PyPDF2 (PDF), python-docx (DOCX)
+  - Validates file size (max 10MB) and format
+  - Extracts transactions as JSON array
+  - Auto-generates transaction_id if missing
+  - Returns: transaction_count, transactions[], file_type
+
+**Tests (test_file_upload.py):**
+- ✅ CSV file upload with data extraction
+- ✅ Missing columns detection
+- ✅ Invalid data types handling
+- ✅ Empty CSV file error handling
+- ✅ Duplicate transaction detection
+- ✅ Unsupported file format rejection
+- ✅ File size limit enforcement (10MB)
+
+**Sample Data:** `data/test_transactions.csv` (20 realistic transactions)
+
+---
+
+### Task 2: Integration - File Upload + Model Testing ✅
+**Status:** COMPLETED - 9 comprehensive integration tests passing
+
+**Implementation:**
+- **Workflow:** Upload CSV → Extract transactions → Select transaction → Run through all 3 models
+- **Functionality:**
+  - Batch processing of multiple transactions
+  - Transaction selector UI for individual analysis
+  - Multi-model comparison (XGBoost, GNN, Hybrid)
+  - Consensus verdict (FRAUD if 2+ models > 0.5)
+  - Real model execution via subprocess
+
+**Tests (test_integration_upload_models.py):**
+- ✅ End-to-end file upload and extraction
+- ✅ Batch processing multiple transactions
+- ✅ Transaction selection from batch
+- ✅ Transaction format validation for all models
+- ✅ Model scoring output format
+- ✅ File drag-drop acceptance
+- ✅ Transaction selector UI
+- ✅ Model comparison display
+- ✅ Consensus verdict display
+
+---
+
+### Task 3: Config Auto-Detection for Embedding Dimensions ✅
+**Status:** COMPLETED - 11 comprehensive tests passing
+
+**Implementation:**
+- **Functionality:** Auto-detect embedding dimensions from `data/processed/user_embeddings.csv`
+- **Features:**
+  - Detects 32D, 64D, 128D, or 256D embeddings
+  - Applies 'gnn_' prefix to column names
+  - Fallback to 64D if file missing
+  - Caches config for consistency
+  - Returns config dict with model parameters
+
+**Tests (test_config_autodetect.py):**
+- ✅ Real embedding file dimension detection
+- ✅ Mock file dimension detection
+- ✅ Various embedding sizes (32D, 64D, 128D, 256D)
+- ✅ Empty file handling
+- ✅ Single column handling
+- ✅ Config dict structure validation
+- ✅ Config value range validation
+- ✅ Config with mock embeddings
+- ✅ Embeddings loading with prefix
+- ✅ Config consistency checks
+- ✅ Fallback to defaults
+
+---
+
+### Task 4: React Error Handling & Input Validation ✅
+**Status:** COMPLETED - 14 comprehensive tests passing
+
+**Implementation:**
+- **Validation Rules:**
+  - Amount: Must be > 0 (no zero or negative)
+  - Hour: Must be 0-23
+  - Transaction count: Must be >= 0 and whole number (no decimals)
+  - User IDs: Must be non-empty strings
+  - Files: CSV, PDF, DOCX, DOC only (max 10MB)
+
+- **Error Handling:**
+  - Network errors (ECONNREFUSED, timeout, ENOTFOUND)
+  - HTTP errors (404, 422, 500)
+  - File validation errors
+  - Input validation errors
+
+**Tests (test_react_error_handling.py):**
+- ✅ Amount validation (positive numbers)
+- ✅ Hour validation (0-23 range)
+- ✅ Transaction count validation (non-negative integers)
+- ✅ User ID validation (non-empty)
+- ✅ Network error detection
+- ✅ File upload error messages
+- ✅ Error alert close button
+- ✅ Error alert detail display
+- ✅ Success alert styling
+- ✅ API health indicator
+- ✅ File type validation
+- ✅ File size validation
+- ✅ Complete form validation
+- ✅ Invalid form detection
+
+---
+
+### Task 5: Edge Weight Calculations for GNN ✅
+**Status:** COMPLETED - 9 comprehensive tests passing
+
+**Implementation:**
+- **Weight Schemes (5 total):**
+  1. **Normalized Amount:** (amount - min) / (max - min)
+  2. **Frequency:** Higher weight for repeated sender-receiver pairs
+  3. **Combined (60/40):** 0.6 × amount + 0.4 × frequency
+  4. **Inverse Amount:** Small transactions get high weights (micro-fraud detection)
+  5. **Fraud Risk:** Custom weighting with indicators (night activity 1.2x, round amounts 0.8x)
+
+- **Features:**
+  - Output range: [0.01, 1.0]
+  - PyTorch tensor conversion
+  - Statistical properties (min, max, mean, std)
+  - Neo4j edge_weight storage on P2P_TRANSFER relationships
+
+**Tests (test_edge_weights.py):**
+- ✅ Normalized amount weights
+- ✅ Frequency weights
+- ✅ Combined weights
+- ✅ Inverse amount weights
+- ✅ Weight output type validation (numpy array, 0.01-1.0 range)
+- ✅ Fraud risk weights
+- ✅ Night activity modifier
+- ✅ PyTorch tensor conversion
+- ✅ Statistical properties (min, max, mean, std)
+
+---
+
+## 9. Testing Suite (50+ Tests, 100% Passing) ✅
+
+### Test Organization
+```
+tests/
+├── Existing Tests (6 files)
+│   ├── test_api.py                  - API endpoint tests
+│   ├── test_forward_pass.py         - Model forward pass
+│   ├── test_gnn.py                  - GNN architecture
+│   ├── test_hybrid_pipeline.py      - Hybrid model pipeline
+│   ├── test_pipeline.py             - Data pipeline
+│   └── test_tensors.py              - PyTorch tensor validation
+├── NEW Task Tests (5 files - 50 tests)
+│   ├── test_file_upload.py          - Task 1 (7 tests)
+│   ├── test_integration_upload_models.py - Task 2 (9 tests)
+│   ├── test_config_autodetect.py    - Task 3 (11 tests)
+│   ├── test_react_error_handling.py - Task 4 (14 tests)
+│   └── test_edge_weights.py         - Task 5 (9 tests)
+├── Documentation
+│   ├── TEST_DOCUMENTATION.md        - Comprehensive test guide
+│   ├── TESTS_READY.md               - Quick start guide
+│   ├── TESTS_QUICK_START.md         - Reference manual
+│   ├── TEST_FIX_SUMMARY.md          - All fixes documented
+│   └── run_tests.py                 - Automated test runner
+└── Sample Data
+    └── data/test_transactions.csv   - 20 realistic transactions
+```
+
+### Running Tests
+```bash
+# All 50 task tests
+python -m pytest tests/test_file_upload.py \
+  tests/test_integration_upload_models.py \
+  tests/test_config_autodetect.py \
+  tests/test_react_error_handling.py \
+  tests/test_edge_weights.py -v
+
+# Individual test files
+pytest tests/test_file_upload.py -v
+pytest tests/test_edge_weights.py -v
+pytest tests/test_config_autodetect.py -v
+
+# All tests in project
+pytest tests/ -q
+```
+
+### Test Results Summary
+| Task | Tests | Status | Coverage |
+|------|-------|--------|----------|
+| 1: File Upload | 7 | ✅ PASSED | FileUpload, Format Validation |
+| 2: Integration | 9 | ✅ PASSED | E2E Workflow, Multi-model |
+| 3: Config | 11 | ✅ PASSED | Auto-detection, Caching |
+| 4: React Errors | 14 | ✅ PASSED | Input Validation, Error Handling |
+| 5: Edge Weights | 9 | ✅ PASSED | 5 Weight Schemes, PyTorch |
+| **TOTAL** | **50** | **✅ PASSED** | **100%** |
+
+---
+
+## 10. System Dependencies & Setup
+
+### Required Python Packages
+```bash
+# Core ML packages
+pip install torch pandas numpy scikit-learn xgboost
+
+# Graph packages
+pip install torch-geometric pyg-lib
+
+# Testing
+pip install pytest
+
+# File parsing
+pip install PyPDF2 python-docx
+
+# Streaming & Database
+pip install kafka neo4j
+
+# API & Frontend
+pip install fastapi pydantic sqlalchemy uvicorn
+```
+
+### Environment Configuration
+- **Python Version:** 3.13.5+
+- **Torch:** 2.3.0 (CPU or CUDA)
+- **PyTorch Geometric:** Latest stable
+- **Neo4j:** 5.x
+- **Kafka:** Docker via docker-compose
+
+---
+
 ## 8. Key Research Contributions
 - **Empirical Proof:** Quantified performance gains on graph fraud vs tabular baselines
 - **Scenario Analysis:** Per-topology recall metrics for fraud rings, fast cash-outs, etc.
+- **Production Integration:** Real model execution, Tier 2 analyst explanations, live detection
+- **Comprehensive Testing:** 50+ tests covering all critical paths, data flows, and edge cases
 - **Operational Feasibility:** Human-in-the-loop design with workload quantification
 - **Scalability:** PyTorch Geometric for large graph processing
 - **Explainability:** GNN architecture supports future GNNExplainer integration

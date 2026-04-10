@@ -226,6 +226,302 @@ The Extraction: We successfully bypassed the Black Box problem of Deep Learning.
 
 The system underwent a major revision focused on improving both data representation (features) and model effectiveness (parameters). This involved expanding the feature space to better capture fraud behavior, incorporating more advanced model parameters as advised by supervisors, and ultimately redesigning the dataset. As a result, a new database was created and the previous version was discarded to ensure consistency with the updated architecture.
 
+## 6. Phase 3 Implementation: Tasks 1-5 (COMPLETE ✅)
+
+### Overview
+Phase 3 focused on production-ready deployment features: file upload, config auto-detection, error handling, edge weighting, and comprehensive testing.
+
+### Task 1: File Upload & Transaction Extraction ✅
+**Implementation Date:** April 10, 2026  
+**Status:** COMPLETE - All endpoints operational
+
+**Endpoint:** `POST /upload-transaction-file`
+
+**Supported Formats:**
+- **CSV:** Uses pandas.read_csv() with automatic column detection
+- **PDF:** PyPDF2 with table extraction
+- **DOCX/DOC:** python-docx with table parsing
+
+**Functionality:**
+```python
+# Input: File upload (multipart/form-data)
+# Output: {
+#   "file_type": "csv",
+#   "transaction_count": 20,
+#   "transactions": [
+#     {"sender_id": "U1", "receiver_id": "U2", "amount": 5000, ...},
+#     ...
+#   ]
+# }
+```
+
+**Validation:**
+- File size limit: 10 MB
+- Format whitelist: .csv, .pdf, .docx, .doc
+- Missing required columns detection
+- Duplicate transaction detection
+- Data type validation
+
+**Test Coverage:** 7 tests - all passing ✅
+
+---
+
+### Task 2: Integration - Upload + Multi-Model Testing ✅
+**Implementation Date:** April 10, 2026  
+**Status:** COMPLETE - All integration workflows tested
+
+**Workflow:**
+1. User uploads CSV/PDF/DOCX file
+2. System extracts transactions
+3. User selects transaction from list
+4. System runs transaction through all 3 models:
+   - XGBoost (baseline)
+   - GNN (graph-based)
+   - Hybrid (ensemble)
+5. System returns consensus verdict
+
+**Endpoint:** `POST /run-transaction-comparison`
+
+**Request:**
+```json
+{
+  "amount": 50000,
+  "velocity": 0,
+  "sender_id": "USER_123",
+  "receiver_id": "USER_456",
+  "hour": 23,
+  "transaction_count": 5
+}
+```
+
+**Response:**
+```json
+{
+  "xgboost": {
+    "score": 0.85,
+    "decision": "FRAUD"
+  },
+  "gnn": {
+    "score": 0.72,
+    "decision": "SUSPICIOUS"
+  },
+  "hybrid": {
+    "score": 0.79,
+    "decision": "FRAUD"
+  },
+  "consensus": {
+    "verdict": "FRAUD",
+    "votes": 2,
+    "reasoning": "XGBoost and Hybrid agree on fraud"
+  }
+}
+```
+
+**Test Coverage:** 9 integration tests - all passing ✅
+
+---
+
+### Task 3: Config Auto-Detection for Embeddings ✅
+**Implementation Date:** April 10, 2026  
+**Status:** COMPLETE - All embedding dimensions auto-detected
+
+**Functionality:**
+Automatically detects neural network embedding dimensions from `data/processed/user_embeddings.csv` and generates appropriate config without manual intervention.
+
+**Detection Algorithm:**
+```python
+# Read user_embeddings.csv
+# Count columns (excluding ID columns)
+# Match to one of: 32D, 64D, 128D, 256D
+# Apply 'gnn_' prefix to column names
+# Return config dict
+```
+
+**Supported Dimensions:**
+- 32D embeddings (compact models)
+- 64D embeddings (default)
+- 128D embeddings (large models)
+- 256D embeddings (very large models)
+
+**Fallback:**
+- If `user_embeddings.csv` missing → default to 64D
+- If invalid dimensions → log warning, use 64D
+
+**Test Coverage:** 11 tests - all passing ✅
+
+---
+
+### Task 4: React Error Handling & Validation ✅
+**Implementation Date:** April 10, 2026  
+**Status:** COMPLETE - All input validation implemented
+
+**Validation Rules:**
+
+| Field | Rule | Type | Test |
+|-------|------|------|------|
+| Amount | > 0 | Float | `test_amount_validation` |
+| Hour | 0-23 | Integer | `test_hour_validation` |
+| Trans. Count | >= 0, integer | Integer | `test_transaction_count_validation` |
+| User ID | Non-empty | String | `test_user_id_validation` |
+
+**File Validation:**
+```
+Type: CSV, PDF, DOCX, DOC only
+Size: Max 10 MB
+Error: User-friendly alert shown
+```
+
+**Error Detection:**
+- Network errors: ECONNREFUSED, timeout, ENOTFOUND
+- HTTP errors: 404, 422, 500
+- Validation errors: Invalid input types
+- File errors: Unsupported format, too large
+
+**Error Display:**
+- Alert component with close button
+- Detailed error message shown
+- Success styling on valid input
+- API health indicator in UI
+
+**Test Coverage:** 14 tests - all passing ✅
+
+---
+
+### Task 5: Edge Weight Calculations for GNN ✅
+**Implementation Date:** April 10, 2026  
+**Status:** COMPLETE - All 5 weight schemes implemented
+
+**Purpose:** Assign importance weights to transaction edges in Neo4j graph
+
+**5 Weight Schemes:**
+
+1. **Normalized Amount**
+   - Formula: (amount - min) / (max - min)
+   - Use: High-value transactions more important
+   - Range: [0.01, 1.0]
+
+2. **Frequency**
+   - Formula: repeated_pairs / total_pairs
+   - Use: Detect collusion rings (repeated senders)
+   - Range: [0.01, 1.0]
+
+3. **Combined (60/40 Hybrid)**
+   - Formula: 0.6 × normalized_amount + 0.4 × frequency
+   - Use: Balanced approach for most fraud
+   - Range: [0.01, 1.0]
+
+4. **Inverse Amount**
+   - Formula: 1 / (normalized_amount + ε)
+   - Use: Micro-fraud detection (small repeated transfers)
+   - Range: [0.01, 1.0]
+
+5. **Fraud Risk**
+   - Formula: base_weight × fraud_indicators
+   - Modifiers:
+     - Night activity flag: 1.2x
+     - Round amount flag: 0.8x
+     - Device sharing flag: 1.3x
+   - Use: Risk-weighted GNN input
+   - Range: [0.01, 1.0]
+
+**Neo4j Integration:**
+```cypher
+MATCH (s:User)-[r:P2P_TRANSFER]->(t:User)
+SET r.edge_weight = 0.75
+RETURN r.edge_weight
+```
+
+**PyTorch Output:**
+```python
+# Tensor shape: [num_edges, 1]
+# Values normalized and bounded
+# Ready for GNN input layer
+```
+
+**Test Coverage:** 9 tests - all passing ✅
+- Weight calculation correctness
+- Output type validation (numpy arrays)
+- Range validation [0.01, 1.0]
+- PyTorch tensor conversion
+- Statistical properties (min, max, mean, std)
+
+---
+
+## 7. Comprehensive Testing Suite (50+ Tests, 100% Passing)
+
+### Test Architecture
+
+**Test Files:**
+```
+tests/
+├── Task-Specific Tests (5 files - 50 total)
+│   ├── test_file_upload.py              [7 tests]
+│   ├── test_integration_upload_models.py [9 tests]
+│   ├── test_config_autodetect.py        [11 tests]
+│   ├── test_react_error_handling.py     [14 tests]
+│   └── test_edge_weights.py             [9 tests]
+├── Framework Tests (6 files)
+│   ├── test_api.py
+│   ├── test_forward_pass.py
+│   ├── test_gnn.py
+│   ├── test_hybrid_pipeline.py
+│   ├── test_pipeline.py
+│   └── test_tensors.py
+└── Sample Data
+    └── data/test_transactions.csv       [20 transactions]
+```
+
+### Test Execution
+
+```bash
+# Run all task tests
+pytest tests/test_file_upload.py \
+  tests/test_integration_upload_models.py \
+  tests/test_config_autodetect.py \
+  tests/test_react_error_handling.py \
+  tests/test_edge_weights.py -v
+
+# Results: 50/50 PASSED ✅
+```
+
+### Test Coverage by Task
+
+| Task | Component | Tests | Passing |
+|------|-----------|-------|---------|
+| 1 | File Upload | 7 | 7 ✅ |
+| 2 | Integration | 9 | 9 ✅ |
+| 3 | Config Auto-Detect | 11 | 11 ✅ |
+| 4 | Error Handling | 14 | 14 ✅ |
+| 5 | Edge Weights | 9 | 9 ✅ |
+| **Total** | **All Tasks** | **50** | **50 ✅** |
+
+---
+
+## 8. System Status (Phase 3 Complete)
+
+### Operational Components
+- ✅ Backend FastAPI (11 endpoints)
+- ✅ Frontend React (8 pages)
+- ✅ Neo4j Graph Database
+- ✅ SQLite Transaction Log
+- ✅ Kafka Streaming Pipeline
+- ✅ ML Models (XGBoost, GNN, Hybrid)
+- ✅ File Upload & Parsing
+- ✅ Config Auto-Detection
+- ✅ Error Handling & Validation
+- ✅ Edge Weighting (5 schemes)
+- ✅ Comprehensive Test Suite (50+ tests)
+
+### Recent Fixes & Improvements
+- Fixed empty CSV file handling with pytest.raises()
+- Made edge weight tests data-driven (dynamic min/max)
+- Fixed transaction count validation (type checking before conversion)
+- Added 5 comprehensive test files (50 new tests)
+- Created sample CSV for testing (data/test_transactions.csv)
+- 100% test pass rate
+
+---
+
 OUR FINAL DATASET SUMMARY:Fraud-Intel
 Users: 10,000
 Transactions: 100,000

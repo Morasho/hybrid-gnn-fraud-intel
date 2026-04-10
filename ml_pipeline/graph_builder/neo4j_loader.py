@@ -1,11 +1,33 @@
 import pandas as pd
 from neo4j import GraphDatabase
 import time
+import numpy as np
 
-print(" Phase 1: High-Performance Neo4j Batch Loader ")
+print(" Phase 1: High-Performance Neo4j Batch Loader with Edge Weights ")
 
 URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "12345678")  # 
+AUTH = ("neo4j", "12345678")
+
+
+def calculate_edge_weights(df: pd.DataFrame) -> np.ndarray:
+    """
+    Calculate edge weights based on transaction amounts.
+    Normalizes amounts to 0-1 range for consistent weight values.
+    """
+    amounts = df['amount'].values
+    min_amount = amounts.min()
+    max_amount = amounts.max()
+    
+    if max_amount == min_amount:
+        weights = np.ones_like(amounts, dtype=np.float32) * 0.5
+    else:
+        weights = (amounts - min_amount) / (max_amount - min_amount)
+        weights = weights.astype(np.float32)
+    
+    # Clip to ensure valid range
+    weights = np.clip(weights, 0.01, 1.0)
+    return weights
+
 
 def batch_load_nodes(tx, query, data, batch_size=2000):
     """Loads nodes in blocks and prints real-time progress to prevent freezing."""
@@ -19,6 +41,12 @@ def batch_load_nodes(tx, query, data, batch_size=2000):
 def load_graph_data():
     print("Loading 100,000 raw transactions from CSV...")
     df = pd.read_csv('data/raw/p2p_transfers.csv')
+    
+    # Calculate edge weights upfront
+    print("Calculating edge weights for GNN...")
+    edge_weights = calculate_edge_weights(df)
+    df['edge_weight'] = edge_weights
+    print(f"Edge weights calculated: min={edge_weights.min():.4f}, max={edge_weights.max():.4f}, mean={edge_weights.mean():.4f}")
 
     # 1. Extract Unique Entities
     unique_users = pd.concat([df['sender_id'], df['receiver_id']]).unique()
@@ -57,7 +85,7 @@ def load_graph_data():
         #  LOAD EDGES 
         print(f"Pushing {len(edges_data)} P2P Transfers & Connections to Neo4j... (This may take a minute)")
         
-        # 1. The P2P Money Transfer
+        # 1. The P2P Money Transfer (with edge weights for GNN)
         p2p_query = """
         UNWIND $batch AS row
         MATCH (sender:User {user_id: row.sender_id})
@@ -66,7 +94,8 @@ def load_graph_data():
             amount: toFloat(row.amount),
             timestamp: row.timestamp,
             is_fraud: toInteger(row.is_fraud),
-            fraud_scenario: row.fraud_scenario
+            fraud_scenario: row.fraud_scenario,
+            edge_weight: toFloat(row.edge_weight)
         }]->(receiver)
         """
         session.execute_write(batch_load_nodes, p2p_query, edges_data)

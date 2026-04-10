@@ -3,8 +3,9 @@ import torch
 from torch_geometric.data import HeteroData
 from sklearn.preprocessing import StandardScaler
 import os
+from edge_weights import create_edge_weight_tensor, print_weight_statistics
 
-print(" Phase 1.9: PyTorch Tensor Conversion ")
+print(" Phase 1.9: PyTorch Tensor Conversion with Edge Weights ")
 
 # 1. Load the Ultimate Dataset
 print("Loading 22-feature defense-ready dataset...")
@@ -48,6 +49,12 @@ data['user'].x = torch.tensor(x_scaled, dtype=torch.float)
 # 5. Add the Edges (The Network Graph)
 edge_index = torch.tensor([df['sender_idx'].values, df['receiver_idx'].values], dtype=torch.long)
 data['user', 'p2p', 'user'].edge_index = edge_index
+
+# Add Edge Weights based on transaction amounts (GNN will learn which patterns matter)
+print("Calculating edge weights based on transaction characteristics...")
+edge_weights = create_edge_weight_tensor(df, weight_scheme='normalized_amount')
+data['user', 'p2p', 'user'].edge_weight = edge_weights
+print_weight_statistics(edge_weights.numpy())
 
 # Add the labels (1 = Fraud, 0 = Safe)
 data['user', 'p2p', 'user'].y = torch.tensor(df['is_fraud'].values, dtype=torch.long)

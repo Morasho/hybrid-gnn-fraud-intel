@@ -10,6 +10,12 @@ export default function AIBot() {
   const [txExplanation, setTxExplanation] = useState(null);
   const [txLoading, setTxLoading] = useState(false);
 
+  const modelStrengths = explanation?.strengths || [];
+  const modelWeaknesses = explanation?.weaknesses || [];
+  const performanceOnCases = explanation?.performance_on_cases || { caught: 0, missed: 0 };
+  const modelAgreement = txExplanation?.model_agreement || {};
+  const riskFactors = txExplanation?.risk_factors || [];
+
   // Fetch model explanation
   useEffect(() => {
     setLoading(true);
@@ -116,7 +122,7 @@ export default function AIBot() {
                     Strengths
                   </h3>
                   <ul className="space-y-2">
-                    {explanation.strengths.map((strength, idx) => (
+                    {modelStrengths.map((strength, idx) => (
                       <li key={idx} className="text-sm text-gray-700">{strength}</li>
                     ))}
                   </ul>
@@ -129,7 +135,7 @@ export default function AIBot() {
                     Weaknesses
                   </h3>
                   <ul className="space-y-2">
-                    {explanation.weaknesses.map((weakness, idx) => (
+                    {modelWeaknesses.map((weakness, idx) => (
                       <li key={idx} className="text-sm text-gray-700">{weakness}</li>
                     ))}
                   </ul>
@@ -146,10 +152,10 @@ export default function AIBot() {
                 <div className="bg-white border border-gray-200 rounded-xl p-6">
                   <h3 className="font-bold text-gray-900 mb-3">Test Case Performance</h3>
                   <p className="text-sm text-gray-600">
-                    Caught: <span className="font-bold text-green-600">{explanation.performance_on_cases.caught}/5</span>
+                    Caught: <span className="font-bold text-green-600">{performanceOnCases.caught}</span>
                   </p>
                   <p className="text-sm text-gray-600">
-                    Missed: <span className="font-bold text-red-600">{explanation.performance_on_cases.missed}/5</span>
+                    Missed: <span className="font-bold text-red-600">{performanceOnCases.missed}</span>
                   </p>
                 </div>
               </div>
@@ -208,7 +214,7 @@ export default function AIBot() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              {Object.entries(txExplanation.model_agreement).map(([model, explanation_text]) => (
+              {Object.entries(modelAgreement).map(([model, explanation_text]) => (
                 <div key={model} className="bg-gray-50 p-3 rounded-lg border border-gray-200">
                   <p className="text-xs font-semibold text-gray-700 capitalize mb-1">{model.replace(/_/g, ' ')}</p>
                   <p className="text-sm text-gray-700">{explanation_text}</p>
@@ -219,7 +225,7 @@ export default function AIBot() {
             <div className="bg-blue-50 border border-blue-200 p-4 rounded-lg">
               <p className="text-sm font-semibold text-gray-900 mb-2">Risk Factors</p>
               <ul className="space-y-1">
-                {txExplanation.risk_factors.map((factor, idx) => (
+                {riskFactors.map((factor, idx) => (
                   <li key={idx} className="text-sm text-gray-700">• {factor}</li>
                 ))}
               </ul>

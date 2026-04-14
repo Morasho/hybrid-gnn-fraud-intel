@@ -2,31 +2,54 @@ import { useState, useEffect } from 'react';
 import { BarChart3, TrendingUp, AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
 import axios from 'axios';
 
+const API_BASE = 'http://127.0.0.1:8000';
+
 export default function ModelComparison() {
   const [selectedModel, setSelectedModel] = useState('stacked_hybrid');
   const [metrics, setMetrics] = useState(null);
   const [loading, setLoading] = useState(false);
   const [runningModel, setRunningModel] = useState(false);
+  const [datasetInfo, setDatasetInfo] = useState(null);
+  const [error, setError] = useState(null);
 
-  // Fetch metrics for selected model (from cache or live run)
-  useEffect(() => {
+  const fetchModelMetrics = async (modelKey) => {
     setLoading(true);
-    axios.get(`http://127.0.0.1:8000/model-metrics?model=${selectedModel}`)
-      .then(res => setMetrics(res.data))
-      .catch(err => console.error('Error fetching metrics:', err))
-      .finally(() => setLoading(false));
+    setError(null);
+    try {
+      const [metricsRes, datasetRes] = await Promise.all([
+        axios.get(`${API_BASE}/model-metrics?model=${modelKey}`),
+        axios.get(`${API_BASE}/dataset-status`),
+      ]);
+      setMetrics(metricsRes.data);
+      setDatasetInfo(metricsRes.data?.dataset || datasetRes.data?.dataset || null);
+    } catch (err) {
+      console.error('Error fetching metrics:', err);
+      setError('Could not fetch model metrics from the backend.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchModelMetrics(selectedModel);
   }, [selectedModel]);
 
-  // Run the actual model script
+  useEffect(() => {
+    const refresh = () => fetchModelMetrics(selectedModel);
+    window.addEventListener('dataset-updated', refresh);
+    return () => window.removeEventListener('dataset-updated', refresh);
+  }, [selectedModel]);
+
   const handleRunModel = async () => {
     setRunningModel(true);
+    setError(null);
     try {
-      const response = await axios.get(`http://127.0.0.1:8000/run-model-evaluation/${selectedModel}`);
-      if (response.data.metrics) {
-        setMetrics(response.data.metrics);
-      }
+      const response = await axios.get(`${API_BASE}/run-model-evaluation/${selectedModel}`);
+      setMetrics(response.data.metrics || response.data);
+      setDatasetInfo(response.data.dataset || response.data.metrics?.dataset || null);
     } catch (err) {
       console.error('Error running model:', err);
+      setError('Model evaluation failed. Check that the backend and model scripts are available.');
     } finally {
       setRunningModel(false);
     }
@@ -40,8 +63,24 @@ export default function ModelComparison() {
     return <div className="p-4 text-center text-gray-500">No metrics available</div>;
   }
 
+  const overall = metrics.overall_metrics || metrics;
+  const casesCaught = metrics.cases_caught || [];
+  const casesMissed = metrics.cases_missed || [];
+  const breakdown = metrics.per_case_breakdown || [];
+
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+      {error && (
+        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {error}
+        </div>
+      )}
+
+      {datasetInfo && (
+        <div className="mb-4 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
+          <strong>Active dataset:</strong> {datasetInfo.source_name || 'current upload'} • {datasetInfo.row_count || 0} rows
+        </div>
+      )}
       {/* Model Selection Tabs */}
       <div className="flex gap-2 mb-6 border-b pb-4">
         {['xgboost', 'gnn', 'stacked_hybrid'].map((model) => (
@@ -83,10 +122,10 @@ export default function ModelComparison() {
       {/* Metrics Grid (Precision, Recall, F1, Accuracy) */}
       <div className="grid grid-cols-4 gap-3 mb-8">
         {[
-          { label: 'Precision', value: (metrics.precision * 100).toFixed(1), suffix: '%' },
-          { label: 'Recall', value: (metrics.recall * 100).toFixed(1), suffix: '%' },
-          { label: 'F1 Score', value: (metrics.f1 * 100).toFixed(1), suffix: '%' },
-          { label: 'Accuracy', value: (metrics.accuracy * 100).toFixed(1), suffix: '%' }
+          { label: 'Precision', value: (((overall.precision ?? 0) * 100).toFixed(1)), suffix: '%' },
+          { label: 'Recall', value: (((overall.recall ?? 0) * 100).toFixed(1)), suffix: '%' },
+          { label: 'F1 Score', value: (((overall.f1 ?? 0) * 100).toFixed(1)), suffix: '%' },
+          { label: 'Accuracy', value: (((overall.accuracy ?? 0) * 100).toFixed(1)), suffix: '%' }
         ].map((metric, idx) => (
           <div
             key={idx}
@@ -106,16 +145,16 @@ export default function ModelComparison() {
         <div className="bg-green-50 p-4 rounded-lg border border-green-200">
           <div className="flex items-center gap-2 mb-3">
             <CheckCircle2 className="text-green-600" size={20} />
-            <h3 className="font-bold text-gray-900">Cases Caught ({metrics.cases_caught_count})</h3>
+            <h3 className="font-bold text-gray-900">Cases Caught ({metrics.cases_caught_count ?? casesCaught.length})</h3>
           </div>
           <div className="space-y-2">
-            {metrics.cases_caught?.map((case_item) => (
+            {casesCaught.map((case_item) => (
               <div
                 key={case_item.id}
                 className="bg-white p-2 rounded border border-green-200 text-sm"
               >
                 <p className="font-medium text-gray-900">{case_item.name}</p>
-                <p className="text-xs text-gray-600">{case_item.id}</p>
+                <p className="text-xs text-gray-600">{case_item.summary || case_item.id}</p>
               </div>
             ))}
           </div>
@@ -125,17 +164,17 @@ export default function ModelComparison() {
         <div className="bg-red-50 p-4 rounded-lg border border-red-200">
           <div className="flex items-center gap-2 mb-3">
             <AlertTriangle className="text-red-600" size={20} />
-            <h3 className="font-bold text-gray-900">Cases Missed ({metrics.cases_missed_count})</h3>
+            <h3 className="font-bold text-gray-900">Cases Missed ({metrics.cases_missed_count ?? casesMissed.length})</h3>
           </div>
           <div className="space-y-2">
-            {metrics.cases_missed?.length > 0 ? (
-              metrics.cases_missed.map((case_item) => (
+            {casesMissed.length > 0 ? (
+              casesMissed.map((case_item) => (
                 <div
                   key={case_item.id}
                   className="bg-white p-2 rounded border border-red-200 text-sm"
                 >
                   <p className="font-medium text-gray-900">{case_item.name}</p>
-                  <p className="text-xs text-gray-600">{case_item.id}</p>
+                  <p className="text-xs text-gray-600">{case_item.summary || case_item.id}</p>
                 </div>
               ))
             ) : (
@@ -144,6 +183,20 @@ export default function ModelComparison() {
           </div>
         </div>
       </div>
+
+      {breakdown.length > 0 && (
+        <div className="mb-8 bg-slate-50 p-4 rounded-lg border border-slate-200">
+          <h4 className="font-bold text-gray-900 mb-3">Fraud Case Breakdown</h4>
+          <div className="space-y-2">
+            {breakdown.map((item) => (
+              <div key={item.id} className="flex items-center justify-between bg-white rounded border px-3 py-2 text-sm">
+                <span className="font-medium text-gray-900">{item.name}</span>
+                <span className="text-gray-600">Caught: {item.caught} • Missed: {item.missed} • Recall: {(item.recall * 100).toFixed(1)}%</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Strengths & Shortcomings */}
       <div className="grid grid-cols-2 gap-4">

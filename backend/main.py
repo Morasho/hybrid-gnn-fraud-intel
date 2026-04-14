@@ -10,6 +10,7 @@ import os
 import sqlite3
 import io
 import re
+import sys
 from datetime import datetime
 import subprocess
 import json
@@ -278,6 +279,166 @@ def load_active_dataset() -> tuple[pd.DataFrame, dict[str, Any]]:
     }
 
 
+def prepare_hybrid_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    feature_frame = df.copy()
+    expected_features = list(getattr(hybrid_model, "feature_names_in_", []))
+    if not expected_features:
+        expected_features = [
+            "amount", "num_accounts_linked", "shared_device_flag", "avg_transaction_amount",
+            "transaction_frequency", "num_unique_recipients", "transactions_last_24hr",
+            "round_amount_flag", "night_activity_flag", "hour", "triad_closure_score",
+            "pagerank_score", "in_degree", "out_degree", "cycle_indicator"
+        ]
+
+    embeddings_path = os.path.join(BASE_DIR, "data", "processed", "user_embeddings.csv")
+    if os.path.exists(embeddings_path) and {"sender_id", "receiver_id"}.issubset(feature_frame.columns):
+        embeddings_df = pd.read_csv(embeddings_path)
+        sender_embeddings = embeddings_df.add_prefix("gnn_sender_")
+        receiver_embeddings = embeddings_df.add_prefix("gnn_receiver_")
+
+        feature_frame = feature_frame.merge(
+            sender_embeddings,
+            left_on="sender_id",
+            right_on="gnn_sender_user_id",
+            how="left",
+        )
+        feature_frame = feature_frame.merge(
+            receiver_embeddings,
+            left_on="receiver_id",
+            right_on="gnn_receiver_user_id",
+            how="left",
+        )
+
+        embedding_cols = [
+            column for column in feature_frame.columns
+            if column.startswith("gnn_sender_") or column.startswith("gnn_receiver_")
+        ]
+        if embedding_cols:
+            feature_frame[embedding_cols] = feature_frame[embedding_cols].fillna(0)
+
+        sender_cols = [c for c in feature_frame.columns if c.startswith("gnn_sender_") and c != "gnn_sender_user_id"]
+        receiver_cols = [c for c in feature_frame.columns if c.startswith("gnn_receiver_") and c != "gnn_receiver_user_id"]
+
+        if sender_cols and receiver_cols and len(sender_cols) == len(receiver_cols):
+            sender_mat = feature_frame[sender_cols].to_numpy()
+            receiver_mat = feature_frame[receiver_cols].to_numpy()
+            sender_norms = np.linalg.norm(sender_mat, axis=1, keepdims=True)
+            receiver_norms = np.linalg.norm(receiver_mat, axis=1, keepdims=True)
+            cosine_denom = np.maximum(sender_norms * receiver_norms, 1e-8)
+            topo_features = pd.DataFrame(
+                {
+                    "topo_dot_product": np.sum(sender_mat * receiver_mat, axis=1),
+                    "topo_l2_distance": np.linalg.norm(sender_mat - receiver_mat, axis=1),
+                    "topo_l1_distance": np.sum(np.abs(sender_mat - receiver_mat), axis=1),
+                    "topo_cosine_sim": np.sum(sender_mat * receiver_mat, axis=1) / cosine_denom.squeeze(),
+                },
+                index=feature_frame.index,
+            )
+            feature_frame = pd.concat([feature_frame, topo_features], axis=1)
+
+    missing_features = [feature for feature in expected_features if feature not in feature_frame.columns]
+    if missing_features:
+        zero_frame = pd.DataFrame(0, index=feature_frame.index, columns=missing_features)
+        feature_frame = pd.concat([feature_frame, zero_frame], axis=1)
+
+    return feature_frame[expected_features].copy()
+
+
+def parse_script_metrics(script_output: str, model_type: str) -> dict[str, Any] | None:
+    if not script_output:
+        return None
+
+    lines = [line.strip() for line in script_output.splitlines() if line.strip()]
+    fraud_metrics = None
+    accuracy = None
+    roc_auc = None
+    per_case_breakdown = []
+
+    for line in lines:
+        if "Fraud (1)" in line:
+            parts = line.split()
+            if len(parts) >= 6:
+                try:
+                    fraud_metrics = {
+                        "precision": float(parts[2]),
+                        "recall": float(parts[3]),
+                        "f1": float(parts[4]),
+                    }
+                except ValueError:
+                    pass
+
+        if line.startswith("accuracy"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    accuracy = float(parts[1])
+                except ValueError:
+                    pass
+
+        if "ROC-AUC Score:" in line or "ROC-AUC:" in line:
+            try:
+                roc_auc = float(line.split(":")[-1].strip())
+            except ValueError:
+                pass
+
+        if "|" in line and not line.startswith("Fraud Topology") and not set(line) <= {"-", "|", " "}:
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) >= 4:
+                try:
+                    scenario_name = parts[0]
+                    caught = int(parts[1].split()[0])
+                    missed = int(parts[2].split()[0])
+                    recall = float(parts[3].rstrip("%")) / 100
+                    per_case_breakdown.append({
+                        "id": scenario_name.lower().replace(" ", "_"),
+                        "name": SCENARIO_NAME_MAP.get(scenario_name.lower(), scenario_name.replace("_", " ").title()),
+                        "caught": caught,
+                        "missed": missed,
+                        "recall": recall,
+                        "summary": f"{scenario_name.replace('_', ' ').title()}: {caught} caught, {missed} missed",
+                    })
+                except ValueError:
+                    pass
+
+    if not fraud_metrics:
+        return None
+
+    cases_caught = [item for item in per_case_breakdown if item["caught"] > 0]
+    cases_missed = [item for item in per_case_breakdown if item["missed"] > 0]
+
+    descriptions = {
+        "xgboost": "Real script evaluation from baseline_xgboost.py.",
+        "gnn": "Real script evaluation from evaluate_gnn.py.",
+        "stacked_hybrid": "Real script evaluation from stacked_hybrid.py.",
+    }
+
+    return {
+        "model_name": {
+            "xgboost": "XGBoost (Tabular Only)",
+            "gnn": "GNN (Network-Aware)",
+            "stacked_hybrid": "Stacked Hybrid (XGBoost + GNN)",
+        }[model_type],
+        "description": descriptions[model_type],
+        "overall_metrics": {
+            "precision": fraud_metrics["precision"],
+            "recall": fraud_metrics["recall"],
+            "f1": fraud_metrics["f1"],
+            "accuracy": accuracy or 0.0,
+            "roc_auc": roc_auc or 0.0,
+        },
+        "precision": fraud_metrics["precision"],
+        "recall": fraud_metrics["recall"],
+        "f1": fraud_metrics["f1"],
+        "accuracy": accuracy or 0.0,
+        "roc_auc": roc_auc or 0.0,
+        "cases_caught_count": int(sum(item["caught"] for item in cases_caught)),
+        "cases_missed_count": int(sum(item["missed"] for item in cases_missed)),
+        "cases_caught": cases_caught,
+        "cases_missed": cases_missed,
+        "per_case_breakdown": per_case_breakdown,
+    }
+
+
 def compute_live_metrics_for_model(model_type: str) -> dict[str, Any]:
     df, dataset_meta = load_active_dataset()
     y_true = df["is_fraud"].astype(int)
@@ -323,19 +484,8 @@ def compute_live_metrics_for_model(model_type: str) -> dict[str, Any]:
         eval_y, eval_scen = y_true, scenarios
 
     else:
-        feature_frame = df.copy()
-        expected_features = list(getattr(hybrid_model, "feature_names_in_", []))
-        if not expected_features:
-            expected_features = [
-                "amount", "num_accounts_linked", "shared_device_flag", "avg_transaction_amount",
-                "transaction_frequency", "num_unique_recipients", "transactions_last_24hr",
-                "round_amount_flag", "night_activity_flag", "hour", "triad_closure_score",
-                "pagerank_score", "in_degree", "out_degree", "cycle_indicator"
-            ]
-        for feature in expected_features:
-            if feature not in feature_frame.columns:
-                feature_frame[feature] = 0
-        probs = hybrid_model.predict_proba(feature_frame[expected_features])[:, 1] if hybrid_model else np.zeros(len(feature_frame))
+        feature_frame = prepare_hybrid_feature_frame(df)
+        probs = hybrid_model.predict_proba(feature_frame)[:, 1] if hybrid_model else np.zeros(len(feature_frame))
         preds = (probs >= 0.5).astype(int)
         eval_y, eval_scen = y_true, scenarios
 
@@ -903,28 +1053,36 @@ async def run_model_evaluation(model_type: str):
         raise HTTPException(status_code=400, detail="Invalid model type")
 
     script_map = {
-        'xgboost': os.path.join(BASE_DIR, 'ml_pipeline', 'models', 'baseline_xgboost.py'),
-        'gnn': os.path.join(BASE_DIR, 'ml_pipeline', 'models', 'evaluate_gnn.py'),
-        'stacked_hybrid': os.path.join(BASE_DIR, 'ml_pipeline', 'models', 'stacked_hybrid.py')
+        'xgboost': [sys.executable, os.path.join(BASE_DIR, 'ml_pipeline', 'models', 'baseline_xgboost.py')],
+        'gnn': [sys.executable, os.path.join(BASE_DIR, 'ml_pipeline', 'models', 'evaluate_gnn.py')],
+        'stacked_hybrid': [sys.executable, os.path.join(BASE_DIR, 'ml_pipeline', 'models', 'stacked_hybrid.py'), '--summary']
     }
 
     script_output = ""
+    script_status = "not-run"
     try:
         result = subprocess.run(
-            ['python', script_map[model_type]],
+            script_map[model_type],
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
-            timeout=300
+            timeout=900
         )
         script_output = (result.stdout or '') + (result.stderr or '')
+        script_status = "completed" if result.returncode == 0 else f"failed ({result.returncode})"
     except subprocess.TimeoutExpired:
         script_output = 'Model script timed out, but API computed dataset-level metrics.'
+        script_status = "timed-out"
     except Exception as e:
         script_output = f'Script execution warning: {e}'
+        script_status = "failed"
 
     try:
-        metrics = compute_live_metrics_for_model(model_type)
+        parsed_metrics = parse_script_metrics(script_output, model_type)
+        metrics = parsed_metrics or compute_live_metrics_for_model(model_type)
+        if not metrics.get('dataset'):
+            _, dataset_meta = load_active_dataset()
+            metrics['dataset'] = dataset_meta
         metrics_path = os.path.join(BASE_DIR, 'models', 'saved', f'latest_{model_type}_metrics.json')
         os.makedirs(os.path.dirname(metrics_path), exist_ok=True)
         with open(metrics_path, 'w', encoding='utf-8') as f:
@@ -933,6 +1091,7 @@ async def run_model_evaluation(model_type: str):
         return {
             'status': 'completed',
             'model': model_type,
+            'script_status': script_status,
             'dataset': metrics.get('dataset', {}),
             'metrics': metrics,
             'output_preview': script_output[:1200],
@@ -1116,6 +1275,9 @@ def generate_model_explanation(model_type: str, metrics: dict, topology_results:
     
     if not weaknesses:
         weaknesses = ["No major weaknesses detected in test data"]
+
+    total_caught = int(sum(item.get("caught", 0) for item in topology_results.values()))
+    total_missed = int(sum(item.get("missed", 0) for item in topology_results.values()))
     
     return {
         "model_name": config["model_name"],
@@ -1132,6 +1294,10 @@ def generate_model_explanation(model_type: str, metrics: dict, topology_results:
             "roc_auc": f"{roc_auc:.3f}"
         },
         "per_fraud_type": topology_results,
+        "performance_on_cases": {
+            "caught": total_caught,
+            "missed": total_missed,
+        },
         "strengths": strengths,
         "weaknesses": weaknesses,
         "best_for": config["specialization"],
@@ -1146,94 +1312,32 @@ async def ai_explain_model(model_type: str):
     Executes the model and extracts actual performance data.
     """
     try:
-        # Run the model evaluation script
-        if model_type == "xgboost":
-            script_path = os.path.join(BASE_DIR, "ml_pipeline", "models", "baseline_xgboost.py")
-        elif model_type == "gnn":
-            script_path = os.path.join(BASE_DIR, "ml_pipeline", "models", "evaluate_gnn.py")
-        elif model_type == "stacked_hybrid":
-            script_path = os.path.join(BASE_DIR, "ml_pipeline", "models", "stacked_hybrid.py")
-        else:
+        if model_type not in {"xgboost", "gnn", "stacked_hybrid"}:
             raise HTTPException(status_code=404, detail=f"Model {model_type} not found")
-        
-        # Execute model script
-        result = subprocess.run(
-            ["python", script_path],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Model execution failed: {result.stderr}")
-        
-        # Parse the output to extract metrics
-        # Look for performance metrics in output
-        output = result.stdout
-        metrics = {
-            "precision": 0.85,  # default
-            "recall": 0.87,
-            "f1": 0.86,
-            "roc_auc": 0.92
-        }
-        
-        # Extract actual metrics from stdout if available
-        if "precision" in output.lower():
-            try:
-                # Simple extraction of metrics from classification report
-                lines = output.split('\n')
-                for i, line in enumerate(lines):
-                    if 'weighted avg' in line.lower() or 'macro avg' in line.lower():
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            metrics["precision"] = float(parts[1]) if parts[1] != 'precision' else 0.85
-                            metrics["recall"] = float(parts[2]) if parts[2] != 'recall' else 0.87
-            except:
-                pass  # Use defaults if parsing fails
-        
-        # Extract fraud topology results
+
+        live_metrics = compute_live_metrics_for_model(model_type)
+        metrics = live_metrics.get("overall_metrics", {})
         topology_results = {
-            "fraud_ring": {"caught": 0, "missed": 0, "recall": 0},
-            "mule_sim_swap": {"caught": 0, "missed": 0, "recall": 0},
-            "fast_cashout": {"caught": 0, "missed": 0, "recall": 0},
-            "loan_fraud": {"caught": 0, "missed": 0, "recall": 0},
-            "business_fraud": {"caught": 0, "missed": 0, "recall": 0}
+            item["id"]: {
+                "caught": item["caught"],
+                "missed": item["missed"],
+                "recall": item["recall"],
+            }
+            for item in live_metrics.get("per_case_breakdown", [])
         }
-        
-        # Parse fraud topology performance from output
-        try:
-            for fraud_type in topology_results:
-                for line in output.split('\n'):
-                    if fraud_type in line:
-                        parts = line.split('|')
-                        if len(parts) >= 4:
-                            try:
-                                caught = int(parts[1].strip().split()[0])
-                                missed = int(parts[2].strip().split()[0])
-                                recall_str = parts[3].strip().rstrip('%')
-                                topology_results[fraud_type] = {
-                                    "caught": caught,
-                                    "missed": missed,
-                                    "recall": float(recall_str) / 100
-                                }
-                            except:
-                                pass
-        except:
-            pass  # Use defaults if parsing fails
-        
-        # Generate explanation from real metrics
+
         explanation = generate_model_explanation(model_type, metrics, topology_results)
+        explanation["dataset"] = live_metrics.get("dataset", {})
         return explanation
-        
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Model execution timed out")
     except Exception as e:
         # Fallback: return explanation with note about execution failure
         return {
             "model_name": f"{model_type.upper()} Model",
             "error": str(e),
             "note": "Could not execute real model. Using cached metrics.",
+            "strengths": [],
+            "weaknesses": [],
+            "performance_on_cases": {"caught": 0, "missed": 0},
             "suggestion": "Ensure model scripts are available and dependencies installed"
         }
 

@@ -1499,230 +1499,282 @@ async def export_report(report_id: str, format: str = Query("pdf")):
     Returns:
         File download or JSON response
     """
-    try:
-        # Fetch dashboard stats
-        conn = sqlite3.connect("fraud_intel.db")
-        cursor = conn.cursor()
-        
-        # Get transactions for detailed report
-        cursor.execute("""
-            SELECT transaction_id, sender_id, receiver_id, amount, risk_score, decision 
-            FROM transactions 
-            ORDER BY timestamp DESC 
-            LIMIT 100
-        """)
-        transactions = cursor.fetchall()
-        conn.close()
-        
-        # Build report data structure
-        report_data = {
-            "report_id": report_id,
-            "generated_at": datetime.now().isoformat(),
-            "report_type": "CBK Anti-Money Laundering (AML)",
-            "compliance_framework": "Kenya Data Protection Act (2019)",
-            "kpis": {
-                "total_transactions": 0,
-                "fraud_detected": 0,
-                "fraud_rate": 0.0,
-                "model_accuracy": 96.4,
-                "system_uptime": 99.99
-            },
-            "fraud_breakdown": {
-                "fraud_rings": 450,
-                "mule_accounts": 380,
-                "fast_cashout": 620,
-                "loan_fraud": 340,
-                "business_scams": 410
-            },
-            "compliance_status": {
-                "status": "100% Audit Ready",
-                "records_preserved": True,
-                "immutable_ledger": True,
-                "compliance_percentage": 100.0
-            },
-            "transactions": []
-        }
-        
-        # Calculate KPIs from database
-        if transactions:
-            fraud_count = sum(1 for t in transactions if t[5] == "AUTO_FREEZE" or t[5] == "CONFIRMED_FRAUD")
-            report_data["kpis"]["total_transactions"] = len(transactions)
-            report_data["kpis"]["fraud_detected"] = fraud_count
-            report_data["kpis"]["fraud_rate"] = (fraud_count / len(transactions) * 100) if transactions else 0.0
-            
-            # Add transaction details
-            for tx in transactions[:50]:  # Limit to 50 for report
-                report_data["transactions"].append({
-                    "transaction_id": tx[0],
-                    "sender_id": tx[1],
-                    "receiver_id": tx[2],
-                    "amount": float(tx[3]) if tx[3] else 0,
-                    "risk_score": float(tx[4]) if tx[4] else 0,
-                    "decision": tx[5]
-                })
-        
-        # Generate file based on format
-        from fastapi.responses import FileResponse, StreamingResponse
-        from io import BytesIO
-        
-        if format.lower() == "json":
-            # Return JSON
-            return {
-                "status": "success",
-                "data": report_data,
-                "format": "json"
-            }
-        
-        elif format.lower() == "csv":
-            # Generate CSV
-            csv_buffer = BytesIO()
-            
-            # Write report header
-            csv_content = "CBK Anti-Money Laundering (AML) Compliance Report\n"
-            csv_content += f"Report ID,{report_data['report_id']}\n"
-            csv_content += f"Generated,{report_data['generated_at']}\n"
-            csv_content += "\nKPI Summary\n"
-            csv_content += "Metric,Value\n"
-            csv_content += f"Total Transactions,{report_data['kpis']['total_transactions']}\n"
-            csv_content += f"Fraud Detected,{report_data['kpis']['fraud_detected']}\n"
-            csv_content += f"Fraud Rate,{report_data['kpis']['fraud_rate']:.2f}%\n"
-            csv_content += f"Model Accuracy,{report_data['kpis']['model_accuracy']}%\n"
-            csv_content += f"System Uptime,{report_data['kpis']['system_uptime']}%\n"
-            
-            csv_content += "\nFraud Breakdown\n"
-            csv_content += "Fraud Type,Count\n"
-            for fraud_type, count in report_data['fraud_breakdown'].items():
-                csv_content += f"{fraud_type},{count}\n"
-            
-            csv_content += "\nTransaction Details\n"
-            csv_content += "Transaction ID,Sender,Receiver,Amount (KES),Risk Score,Decision\n"
-            for tx in report_data['transactions']:
-                csv_content += f"{tx['transaction_id']},{tx['sender_id']},{tx['receiver_id']},{tx['amount']:.2f},{tx['risk_score']:.2f},{tx['decision']}\n"
-            
-            csv_buffer.write(csv_content.encode('utf-8'))
-            csv_buffer.seek(0)
-            
-            filename = f"compliance_report_{report_id}_{datetime.now().strftime('%Y%m%d')}.csv"
-            return StreamingResponse(
-                iter([csv_buffer.getvalue()]),
-                media_type="text/csv",
-                headers={"Content-Disposition": f"attachment; filename={filename}"}
-            )
-        
-        elif format.lower() == "pdf":
-            # Generate PDF using reportlab
-            try:
-                from reportlab.lib.pagesizes import letter, A4
-                from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-                from reportlab.lib.units import inch
-                from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-                from reportlab.lib import colors
-                from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-                
-                pdf_buffer = BytesIO()
-                doc = SimpleDocTemplate(pdf_buffer, pagesize=A4, topMargin=0.5*inch, bottomMargin=0.5*inch)
-                elements = []
-                styles = getSampleStyleSheet()
-                
-                # Title
-                title_style = ParagraphStyle(
-                    'CustomTitle',
-                    parent=styles['Heading1'],
-                    fontSize=18,
-                    textColor=colors.HexColor('#1F2937'),
-                    spaceAfter=12,
-                    alignment=TA_CENTER,
-                    fontName='Helvetica-Bold'
-                )
-                elements.append(Paragraph("CBK Anti-Money Laundering (AML) Compliance Report", title_style))
-                
-                # Report Info
-                info_style = ParagraphStyle(
-                    'Info',
-                    parent=styles['Normal'],
-                    fontSize=10,
-                    textColor=colors.HexColor('#6B7280'),
-                    spaceAfter=6,
-                    alignment=TA_CENTER
-                )
-                elements.append(Paragraph(f"Report ID: {report_data['report_id']}", info_style))
-                elements.append(Paragraph(f"Generated: {report_data['generated_at']}", info_style))
-                elements.append(Paragraph(f"Compliance Framework: {report_data['compliance_framework']}", info_style))
-                elements.append(Spacer(1, 0.2*inch))
-                
-                # KPI Summary Table
-                elements.append(Paragraph("KPI Summary", styles['Heading2']))
-                kpi_data = [['Metric', 'Value']]
-                kpi_data.append(['Total Transactions', str(report_data['kpis']['total_transactions'])])
-                kpi_data.append(['Fraud Detected', str(report_data['kpis']['fraud_detected'])])
-                kpi_data.append(['Fraud Rate', f"{report_data['kpis']['fraud_rate']:.2f}%"])
-                kpi_data.append(['Model Accuracy', f"{report_data['kpis']['model_accuracy']}%"])
-                kpi_data.append(['System Uptime', f"{report_data['kpis']['system_uptime']}%"])
-                
-                kpi_table = Table(kpi_data, colWidths=[3.5*inch, 2*inch])
-                kpi_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4F46E5')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 12),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1D5DB')),
-                    ('FONTSIZE', (0, 1), (-1, -1), 10),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')])
-                ]))
-                elements.append(kpi_table)
-                elements.append(Spacer(1, 0.2*inch))
-                
-                # Fraud Breakdown
-                elements.append(Paragraph("Fraud Breakdown by Type", styles['Heading2']))
-                fraud_data = [['Fraud Type', 'Count']]
-                for fraud_type, count in report_data['fraud_breakdown'].items():
-                    fraud_data.append([fraud_type.replace('_', ' ').title(), str(count)])
-                
-                fraud_table = Table(fraud_data, colWidths=[3.5*inch, 2*inch])
-                fraud_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#DC2626')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 11),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1D5DB')),
-                    ('FONTSIZE', (0, 1), (-1, -1), 9),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#FEF2F2')])
-                ]))
-                elements.append(fraud_table)
-                elements.append(Spacer(1, 0.2*inch))
-                
-                # Compliance Status
-                elements.append(Paragraph("Compliance Status", styles['Heading2']))
-                compliance_text = f"""
-                <b>Status:</b> {report_data['compliance_status']['status']}<br/>
-                <b>Records Preserved:</b> {'Yes' if report_data['compliance_status']['records_preserved'] else 'No'}<br/>
-                <b>Immutable Ledger:</b> {'Yes' if report_data['compliance_status']['immutable_ledger'] else 'No'}<br/>
-                <b>Compliance Percentage:</b> {report_data['compliance_status']['compliance_percentage']}%
-                """
-                elements.append(Paragraph(compliance_text, styles['Normal']))
-                
-                # Build PDF
-                doc.build(elements)
-                pdf_buffer.seek(0)
-                
-                filename = f"compliance_report_{report_id}_{datetime.now().strftime('%Y%m%d')}.pdf"
-                return StreamingResponse(
-                    iter([pdf_buffer.getvalue()]),
-                    media_type="application/pdf",
-                    headers={"Content-Disposition": f"attachment; filename={filename}"}
-                )
-            except ImportError:
-                raise HTTPException(status_code=400, detail="PDF export requires reportlab library. Install it with: pip install reportlab")
-        
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported format: {format}. Use 'csv', 'pdf', or 'json'")
+    # Legacy endpoint - can be extended in future
+    return {"status": "success", "message": "Export report functionality"}
+
+
+# ============ SETTINGS ENDPOINTS ============
+
+class UserProfile(BaseModel):
+    firstName: str
+    lastName: str
+    email: str
+    role: str
+
+class NotificationSettings(BaseModel):
+    highRisk: bool
+    daily: bool
+    system: bool
+
+class SecuritySettings(BaseModel):
+    twoFAEnabled: bool
+
+class DataRetentionSettings(BaseModel):
+    retentionYears: int
+
+class EmailAddress(BaseModel):
+    email: str
+
+class APIKeyRequest(BaseModel):
+    name: str
+
+class EmailPreference(BaseModel):
+    highRiskAlerts: bool
+    dailySummary: bool
+    weeklyCompliance: bool
+    maintenanceNotifications: bool
+
+class PasswordChange(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
+# In-memory storage for demo (in production, use persistent database)
+user_data = {
+    "profile": {
+        "firstName": "Imbeka",
+        "lastName": "Musa",
+        "email": "analyst@fraudguard.com",
+        "role": "Senior Fraud Analyst"
+    },
+    "notifications": {
+        "highRisk": True,
+        "daily": True,
+        "system": False
+    },
+    "security": {
+        "twoFAEnabled": False
+    },
+    "dataRetention": {
+        "retentionYears": 7
+    },
+    "emails": [
+        {"id": 1, "email": "analyst@fraudguard.com", "isPrimary": True},
+        {"id": 2, "email": "secondary@fraudguard.com", "isPrimary": False}
+    ],
+    "apiKeys": [
+        {"id": 1, "name": "Production API Key", "key": "sk_live_51ABCD...", "created": "2026-03-15", "lastUsed": "2026-04-09"},
+        {"id": 2, "name": "Development API Key", "key": "sk_test_51EFGH...", "created": "2026-04-01", "lastUsed": "2026-04-08"}
+    ],
+    "emailPreferences": {
+        "highRiskAlerts": True,
+        "dailySummary": True,
+        "weeklyCompliance": True,
+        "maintenanceNotifications": False
+    }
+}
+
+next_email_id = 3
+next_api_key_id = 3
+
+
+@app.get("/settings/profile")
+async def get_profile():
+    """Get user profile information"""
+    return user_data["profile"]
+
+
+@app.put("/settings/profile")
+async def update_profile(profile: UserProfile):
+    """Update user profile"""
+    user_data["profile"] = {
+        "firstName": profile.firstName,
+        "lastName": profile.lastName,
+        "email": profile.email,
+        "role": profile.role
+    }
+    return {"status": "success", "message": "Profile updated successfully", "data": user_data["profile"]}
+
+
+@app.get("/settings/notifications")
+async def get_notifications():
+    """Get notification preferences"""
+    return user_data["notifications"]
+
+
+@app.put("/settings/notifications")
+async def update_notifications(settings: NotificationSettings):
+    """Update notification preferences"""
+    user_data["notifications"] = {
+        "highRisk": settings.highRisk,
+        "daily": settings.daily,
+        "system": settings.system
+    }
+    return {"status": "success", "message": "Notification settings updated", "data": user_data["notifications"]}
+
+
+@app.get("/settings/security")
+async def get_security():
+    """Get security settings"""
+    return user_data["security"]
+
+
+@app.put("/settings/security/2fa")
+async def update_2fa(settings: SecuritySettings):
+    """Toggle 2FA"""
+    user_data["security"]["twoFAEnabled"] = settings.twoFAEnabled
+    status = "enabled" if settings.twoFAEnabled else "disabled"
+    return {"status": "success", "message": f"2FA {status}", "data": user_data["security"]}
+
+
+@app.post("/settings/security/password")
+async def change_password(password_change: PasswordChange):
+    """Change user password"""
+    # In production, verify current password against hash
+    return {"status": "success", "message": "Password changed successfully"}
+
+
+@app.get("/settings/data-retention")
+async def get_data_retention():
+    """Get data retention settings"""
+    return user_data["dataRetention"]
+
+
+@app.put("/settings/data-retention")
+async def update_data_retention(settings: DataRetentionSettings):
+    """Update data retention policy"""
+    user_data["dataRetention"]["retentionYears"] = settings.retentionYears
+    return {"status": "success", "message": "Data retention policy updated", "data": user_data["dataRetention"]}
+
+
+@app.get("/settings/emails")
+async def get_emails():
+    """Get all email addresses"""
+    return {"emails": user_data["emails"]}
+
+
+@app.post("/settings/emails")
+async def add_email(email_data: EmailAddress):
+    """Add a new email address"""
+    global next_email_id
+    new_email = {
+        "id": next_email_id,
+        "email": email_data.email,
+        "isPrimary": False
+    }
+    user_data["emails"].append(new_email)
+    next_email_id += 1
+    return {"status": "success", "message": "Email added successfully", "data": new_email}
+
+
+@app.put("/settings/emails/{email_id}")
+async def update_email(email_id: int, email_data: EmailAddress):
+    """Update an email address"""
+    for email in user_data["emails"]:
+        if email["id"] == email_id:
+            email["email"] = email_data.email
+            return {"status": "success", "message": "Email updated successfully", "data": email}
+    return {"status": "error", "message": "Email not found"}
+
+
+@app.delete("/settings/emails/{email_id}")
+async def delete_email(email_id: int):
+    """Delete an email address"""
+    user_data["emails"] = [e for e in user_data["emails"] if e["id"] != email_id]
+    return {"status": "success", "message": "Email deleted successfully"}
+
+
+@app.post("/settings/emails/{email_id}/set-primary")
+async def set_primary_email(email_id: int):
+    """Set email as primary"""
+    for email in user_data["emails"]:
+        email["isPrimary"] = email["id"] == email_id
+    return {"status": "success", "message": "Primary email updated", "data": user_data["emails"]}
+
+
+@app.get("/settings/email-preferences")
+async def get_email_preferences():
+    """Get email notification preferences"""
+    return user_data["emailPreferences"]
+
+
+@app.put("/settings/email-preferences")
+async def update_email_preferences(preferences: EmailPreference):
+    """Update email notification preferences"""
+    user_data["emailPreferences"] = {
+        "highRiskAlerts": preferences.highRiskAlerts,
+        "dailySummary": preferences.dailySummary,
+        "weeklyCompliance": preferences.weeklyCompliance,
+        "maintenanceNotifications": preferences.maintenanceNotifications
+    }
+    return {"status": "success", "message": "Email preferences updated", "data": user_data["emailPreferences"]}
+
+
+@app.get("/settings/api-keys")
+async def get_api_keys():
+    """Get all API keys"""
+    return {"apiKeys": user_data["apiKeys"]}
+
+
+@app.post("/settings/api-keys")
+async def generate_api_key(request: APIKeyRequest):
+    """Generate a new API key"""
+    global next_api_key_id
+    import random
+    import string
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+    # Generate a mock API key
+    prefix = "sk_live_" if "Production" in request.name else "sk_test_"
+    key_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    
+    new_key = {
+        "id": next_api_key_id,
+        "name": request.name,
+        "key": f"{prefix}{key_suffix}...",
+        "created": datetime.now().strftime("%Y-%m-%d"),
+        "lastUsed": "Never"
+    }
+    user_data["apiKeys"].append(new_key)
+    next_api_key_id += 1
+    
+    return {"status": "success", "message": "API key generated successfully", "data": new_key}
 
 
-import io
+@app.delete("/settings/api-keys/{key_id}")
+async def delete_api_key(key_id: int):
+    """Delete an API key"""
+    user_data["apiKeys"] = [k for k in user_data["apiKeys"] if k["id"] != key_id]
+    return {"status": "success", "message": "API key deleted successfully"}
+
+
+@app.post("/settings/export-data")
+async def export_user_data():
+    """Export all user data (GDPR-style data export)"""
+    from datetime import datetime
+    
+    export_data = {
+        "exportDate": datetime.now().isoformat(),
+        "profile": user_data["profile"],
+        "notifications": user_data["notifications"],
+        "emails": user_data["emails"],
+        "apiKeys": [
+            {
+                "name": k["name"],
+                "created": k["created"],
+                "lastUsed": k["lastUsed"]
+            } for k in user_data["apiKeys"]
+        ]
+    }
+    
+    return {
+        "status": "success",
+        "message": "Data export prepared",
+        "data": export_data,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.post("/settings/sessions/logout-all")
+async def logout_all_sessions():
+    """Logout from all active sessions"""
+    return {"status": "success", "message": "Signed out from all sessions"}

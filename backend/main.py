@@ -20,6 +20,7 @@ import tempfile
 import importlib
 from pathlib import Path
 from typing import Any, Literal, Optional
+from threading import Lock
 
 # 1. INITIALIZE APP & CONNECTIONS 
 app = FastAPI(title="M-Pesa Fraud Intelligence API", version="1.0")
@@ -153,6 +154,14 @@ init_db()
 
 ACTIVE_DATASET_PATH = os.path.join(BASE_DIR, "data", "processed", "current_uploaded_dataset.csv")
 ACTIVE_DATASET_META_PATH = os.path.join(BASE_DIR, "data", "processed", "current_uploaded_dataset_meta.json")
+
+TEMP_SAMPLE_DIR = Path(tempfile.gettempdir()) / "hybrid_gnn_fraud_intel_samples"
+TEMP_SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_SAMPLE_CACHE: dict[str, Any] = {
+    "active_session_id": None,
+    "samples": {},
+}
+TEMP_SAMPLE_LOCK = Lock()
 
 STANDARD_COLUMNS = [
     "transaction_id", "sender_id", "receiver_id", "amount", "transactions_last_24hr", "hour",
@@ -660,6 +669,10 @@ class LiveTestRequest(BaseModel):
     case_id: str
     sample: dict[str, Any] | None = None
 
+
+class LiveSampleInferenceRequest(BaseModel):
+    model: Literal["xgboost", "gnn", "stacked_hybrid"]
+
 # 3. THE AI ANALYST BUSINESS LOGIC (Tier 2) 
 def apply_ai_analyst(amount: float, velocity: int, risk_score: float) -> tuple[str, str]:
     """Applies the Kenyan M-Pesa rules to the Hybrid model's risk score."""
@@ -675,6 +688,143 @@ def apply_ai_analyst(amount: float, velocity: int, risk_score: float) -> tuple[s
         return "REQUIRE_HUMAN", "High-value compliance limit exceeded (Wash-Wash rule)."
     else:
         return "REQUIRE_HUMAN", "Ambiguous pattern. Manual review required."
+
+
+def _parse_uploaded_sample_file(content: bytes, filename: str) -> pd.DataFrame:
+    if filename.endswith('.csv'):
+        return pd.read_csv(io.BytesIO(content))
+
+    if filename.endswith('.pdf'):
+        try:
+            import PyPDF2
+
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+            text = "\n".join([(page.extract_text() or '') for page in pdf_reader.pages])
+            return extract_transactions_from_text(text)
+        except ImportError:
+            raise HTTPException(status_code=400, detail='PDF parsing requires PyPDF2')
+
+    if filename.endswith(('.docx', '.doc')):
+        try:
+            from docx import Document
+
+            document = Document(io.BytesIO(content))
+            text = "\n".join([paragraph.text for paragraph in document.paragraphs])
+            return extract_transactions_from_text(text)
+        except ImportError:
+            raise HTTPException(status_code=400, detail='Word parsing requires python-docx')
+
+    raise HTTPException(status_code=400, detail='Unsupported file format. Use CSV, PDF, or Word')
+
+
+def _cleanup_sample_file(path_value: str | None) -> None:
+    if not path_value:
+        return
+    try:
+        sample_path = Path(path_value)
+        if sample_path.exists():
+            sample_path.unlink()
+    except Exception:
+        pass
+
+
+def _store_temporary_sample(df: pd.DataFrame, source_name: str) -> dict[str, Any]:
+    session_id = f"sample_{int(datetime.now().timestamp() * 1000)}"
+    sample_path = TEMP_SAMPLE_DIR / f"{session_id}.csv"
+    df.to_csv(sample_path, index=False)
+
+    sample_meta = {
+        "session_id": session_id,
+        "source_name": source_name,
+        "row_count": int(len(df)),
+        "columns": list(df.columns),
+        "loaded_at": datetime.now().isoformat(),
+        "path": str(sample_path),
+    }
+
+    with TEMP_SAMPLE_LOCK:
+        active_session_id = TEMP_SAMPLE_CACHE.get("active_session_id")
+        if active_session_id and active_session_id in TEMP_SAMPLE_CACHE["samples"]:
+            previous = TEMP_SAMPLE_CACHE["samples"].pop(active_session_id)
+            _cleanup_sample_file(previous.get("path"))
+
+        TEMP_SAMPLE_CACHE["samples"][session_id] = sample_meta
+        TEMP_SAMPLE_CACHE["active_session_id"] = session_id
+
+    return sample_meta
+
+
+def _get_active_sample_meta() -> dict[str, Any] | None:
+    with TEMP_SAMPLE_LOCK:
+        active_session_id = TEMP_SAMPLE_CACHE.get("active_session_id")
+        if not active_session_id:
+            return None
+        return TEMP_SAMPLE_CACHE["samples"].get(active_session_id)
+
+
+def _load_active_sample_df() -> tuple[pd.DataFrame, dict[str, Any]]:
+    sample_meta = _get_active_sample_meta()
+    if not sample_meta:
+        raise HTTPException(status_code=404, detail="No temporary sample data is loaded")
+
+    sample_path = sample_meta.get("path")
+    if not sample_path or not os.path.exists(sample_path):
+        raise HTTPException(status_code=404, detail="Temporary sample file could not be found")
+
+    sample_df = pd.read_csv(sample_path)
+    return standardize_transactions_df(sample_df), sample_meta
+
+
+def _clear_temporary_sample_cache() -> dict[str, Any]:
+    with TEMP_SAMPLE_LOCK:
+        active_session_id = TEMP_SAMPLE_CACHE.get("active_session_id")
+        active_meta = None
+        if active_session_id:
+            active_meta = TEMP_SAMPLE_CACHE["samples"].pop(active_session_id, None)
+        TEMP_SAMPLE_CACHE["active_session_id"] = None
+
+    if active_meta:
+        _cleanup_sample_file(active_meta.get("path"))
+
+    return {"status": "cleared"}
+
+
+def _infer_live_sample_rows(model: str, df: pd.DataFrame) -> dict[str, Any]:
+    results = []
+    for _, row in df.iterrows():
+        sample = row.to_dict()
+        score, predicted, explanation = score_live_test_sample(model, sample)
+        true_label = int(sample.get("is_fraud", 0))
+        results.append(
+            {
+                "transaction_id": sample.get("transaction_id", "UNKNOWN_TX"),
+                "sender_id": sample.get("sender_id", "UNKNOWN_SENDER"),
+                "receiver_id": sample.get("receiver_id", "UNKNOWN_RECEIVER"),
+                "amount": float(sample.get("amount", 0.0)),
+                "true_label": true_label,
+                "predicted": int(predicted),
+                "confidence": round(float(score), 4),
+                "caught": bool(predicted == 1 and true_label == 1),
+                "missed": bool(predicted == 0 and true_label == 1),
+                "correct": bool(predicted == true_label),
+                "fraud_scenario": str(sample.get("fraud_scenario", "normal")),
+                "explanation": explanation,
+            }
+        )
+
+    cases_caught = [item for item in results if item["caught"]]
+    cases_missed = [item for item in results if item["missed"]]
+
+    return {
+        "total_samples": len(results),
+        "fraud_rows": int(sum(item["true_label"] == 1 for item in results)),
+        "predicted_fraud_rows": int(sum(item["predicted"] == 1 for item in results)),
+        "cases_caught_count": len(cases_caught),
+        "cases_missed_count": len(cases_missed),
+        "cases_caught": cases_caught,
+        "cases_missed": cases_missed,
+        "results_preview": results[:20],
+    }
 
 # 4. API ENDPOINTS 
 
@@ -1419,6 +1569,73 @@ async def upload_transaction_file(file: UploadFile = File(...)):
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"File parsing error: {str(e)}")
+
+
+@app.post("/api/samples/load")
+async def load_temporary_sample(file: UploadFile = File(...)):
+    """
+    Parse a CSV/PDF/Word upload into standardized tabular transactions and cache it temporarily.
+    This path is isolated from historical baseline metrics and training datasets.
+    """
+    try:
+        content = await file.read()
+        filename = (file.filename or "uploaded_file").lower()
+
+        raw_df = _parse_uploaded_sample_file(content, filename)
+        standardized_df = standardize_transactions_df(raw_df)
+        sample_meta = _store_temporary_sample(standardized_df, filename)
+
+        return {
+            "status": "loaded",
+            "sample_meta": {
+                key: value for key, value in sample_meta.items() if key != "path"
+            },
+            "transactions": standardized_df.head(50).to_dict(orient="records"),
+            "standardized_columns": STANDARD_COLUMNS,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not load temporary sample: {str(e)}")
+
+
+@app.get("/api/samples/status")
+async def get_temporary_sample_status():
+    sample_meta = _get_active_sample_meta()
+    if not sample_meta:
+        return {"loaded": False}
+
+    return {
+        "loaded": True,
+        "sample_meta": {
+            key: value for key, value in sample_meta.items() if key != "path"
+        },
+    }
+
+
+@app.post("/api/samples/clear")
+async def clear_temporary_samples():
+    return _clear_temporary_sample_cache()
+
+
+@app.post("/api/inference/live-sample")
+async def run_live_sample_inference(body: LiveSampleInferenceRequest):
+    """
+    Zone 2 endpoint: run selected model inference only on temporary cached sample data.
+    This endpoint never mutates Zone 1 static baseline metrics.
+    """
+    sample_df, sample_meta = _load_active_sample_df()
+    inference = _infer_live_sample_rows(body.model, sample_df)
+
+    return {
+        "status": "completed",
+        "zone": "zone_2_live_inference",
+        "model": body.model,
+        "sample_meta": {
+            key: value for key, value in sample_meta.items() if key != "path"
+        },
+        **inference,
+    }
 
 
 @app.post("/run-transaction-comparison")

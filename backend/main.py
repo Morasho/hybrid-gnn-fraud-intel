@@ -99,6 +99,14 @@ async def send_alert(payload: AlertPayload):  # ✅ Now AlertPayload is already 
 URI = "neo4j://localhost:7687"
 AUTH = ("neo4j", "12345678")
 driver = GraphDatabase.driver(URI, auth=AUTH)
+PREDICT_GRAPH_CONTEXT_DEFAULTS = {
+    "num_unique_recipients": 1,
+    "in_degree": 0,
+    "out_degree": 1,
+    "triad_closure_score": 0.0,
+    "pagerank_score": 0.0,
+    "cycle_indicator": 0,
+}
 
 # Load the trained Tier 1 inference artifacts
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -143,6 +151,51 @@ def load_pickle_artifact(model_type: str) -> Any | None:
 
 
 hybrid_model = load_pickle_artifact("stacked_hybrid")
+
+
+def fetch_predict_graph_context(sender_id: str, receiver_id: str, tx_id: str, amount: float) -> dict[str, Any]:
+    cypher_query = """
+    MERGE (s:User {user_id: $sender_id})
+    MERGE (r:User {user_id: $receiver_id})
+    MERGE (s)-[tx:SENT_MONEY {transaction_id: $tx_id}]->(r)
+    SET tx.amount = toFloat($amount)
+    WITH s, r
+    OPTIONAL MATCH (s)-[:SENT_MONEY]->(recipient:User)
+    WITH s, r, count(DISTINCT recipient) AS out_degree
+    OPTIONAL MATCH (:User)-[:SENT_MONEY]->(s)
+    WITH s, r, out_degree, count(*) AS in_degree
+    OPTIONAL MATCH (s)-[:SENT_MONEY]->(:User)-[:SENT_MONEY]->(r)
+    RETURN out_degree AS num_unique_recipients,
+           in_degree,
+           out_degree,
+           count(*) AS triad_paths,
+           CASE WHEN EXISTS((r)-[:SENT_MONEY]->(s)) THEN 1 ELSE 0 END AS cycle_indicator
+    """
+
+    with driver.session() as session:
+        record = session.run(
+            cypher_query,
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            tx_id=tx_id,
+            amount=amount,
+        ).single()
+
+    if not record:
+        return PREDICT_GRAPH_CONTEXT_DEFAULTS.copy()
+
+    out_degree = int(record.get("out_degree") or 1)
+    in_degree = int(record.get("in_degree") or 0)
+    triad_paths = int(record.get("triad_paths") or 0)
+
+    return {
+        "num_unique_recipients": max(int(record.get("num_unique_recipients") or out_degree), 1),
+        "in_degree": in_degree,
+        "out_degree": max(out_degree, 1),
+        "triad_closure_score": float(min(triad_paths, 5) / 5.0),
+        "pagerank_score": float(min((out_degree + in_degree) / 20.0, 1.0)),
+        "cycle_indicator": int(record.get("cycle_indicator") or 0),
+    }
 
 
 #  SQLITE DATABASE INITIALIZATION 
@@ -1399,57 +1452,47 @@ async def predict_fraud(tx: TransactionRequest):
     3. Runs Hybrid Model. 
     4. Applies AI Analyst rules.
     """
-    # 1. LIVE GRAPH UPDATE: Add the new transaction, then count the connections
-    cypher_query = """
-    // Ensure both users exist in the graph
-    MERGE (s:User {user_id: $sender_id})
-    MERGE (r:User {user_id: $receiver_id})
-    
-    // Draw the new transaction line (The Graph Update)
-    MERGE (s)-[tx:SENT_MONEY {transaction_id: $tx_id}]->(r)
-    SET tx.amount = toFloat($amount)
-    
-    // Calculate the updated network topology for the model
-    WITH s
-    MATCH (s)-[:SENT_MONEY]->(u:User)
-    RETURN count(DISTINCT u) AS num_unique_recipients
-    """
-    
+    graph_context = PREDICT_GRAPH_CONTEXT_DEFAULTS.copy()
     try:
-        with driver.session() as session:
-            result = session.run(
-                cypher_query, 
-                sender_id=tx.sender_id,
-                receiver_id=tx.receiver_id,
-                tx_id=tx.transaction_id,
-                amount=tx.amount
+        graph_context.update(
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    fetch_predict_graph_context,
+                    tx.sender_id,
+                    tx.receiver_id,
+                    tx.transaction_id,
+                    tx.amount,
+                ),
+                timeout=4.0,
             )
-            record = result.single()
-            num_unique_recipients = record["num_unique_recipients"] if record else 0
-            
-            mock_gnn_score = 0.45 
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Neo4j Database Error: {str(e)}")
+        print(f"WARNING: Neo4j graph context unavailable for /predict, using fallback values. Details: {str(e)}")
 
-    # 2. Build the exact feature row our XGBoost model expects
-    features = pd.DataFrame([{
+    # 2. Build the exact feature row our hybrid model expects
+    row = pd.DataFrame([{
+        "transaction_id": tx.transaction_id,
+        "sender_id": tx.sender_id,
+        "receiver_id": tx.receiver_id,
         "amount": tx.amount,
-        "num_accounts_linked": 1,                      
-        "shared_device_flag": 0,                       
-        "avg_transaction_amount": 1500.0,              
-        "transaction_frequency": 2,                    
-        "num_unique_recipients": num_unique_recipients,
-        "transactions_last_24hr": tx.transactions_last_24hr, 
-        "round_amount_flag": 1 if tx.amount % 100 == 0 else 0, 
-        "hour": tx.hour,                               
+        "num_accounts_linked": 1,
+        "shared_device_flag": 0,
+        "avg_transaction_amount": 1500.0,
+        "transaction_frequency": max(tx.transactions_last_24hr, 1),
+        "num_unique_recipients": graph_context["num_unique_recipients"],
+        "transactions_last_24hr": tx.transactions_last_24hr,
+        "round_amount_flag": 1 if tx.amount % 100 == 0 else 0,
+        "hour": tx.hour,
         "night_activity_flag": 1 if tx.hour < 5 else 0,
-        "triad_closure_score": 0.1,                    
-        "pagerank_score": 0.005,                       
-        "in_degree": 2,                                
-        "out_degree": num_unique_recipients,           
-        "cycle_indicator": 0,                          
-        "gnn_fraud_risk_score": mock_gnn_score         
+        "triad_closure_score": graph_context["triad_closure_score"],
+        "pagerank_score": graph_context["pagerank_score"],
+        "in_degree": graph_context["in_degree"],
+        "out_degree": graph_context["out_degree"],
+        "cycle_indicator": graph_context["cycle_indicator"],
+        "is_fraud": 0,
+        "fraud_scenario": "normal",
     }])
+    features = prepare_hybrid_feature_frame(row)
 
     # 3. Model Inference
     try:
@@ -1458,9 +1501,9 @@ async def predict_fraud(tx: TransactionRequest):
             raise RuntimeError("Hybrid model is not loaded. Please restart the server or check the model file.")
         # Wrap it in float() to convert from numpy to native Python float
         risk_score = float(hybrid_model.predict_proba(features)[0][1])
-        print(f"✅ XGBoost Calculation Success! Real Risk Score: {risk_score}")
+        print(f"INFO: Hybrid prediction succeeded. Risk score: {risk_score}")
     except Exception as e:
-         print(f"❌ XGBoost Feature Mismatch Error: {str(e)}") 
+         print(f"ERROR: Hybrid prediction failed. Details: {str(e)}") 
          risk_score = 0.65 
 
     # 4. Tier 2 AI Analyst Decision

@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Beaker, BarChart3, Database } from 'lucide-react';
 import axios from 'axios';
+import { useSampleData } from '../context/SampleDataContext';
 
 export default function TestCaseSampler({ onCaseSelect }) {
+  const { loadedSample, clearLoadedSample, checkingStatus } = useSampleData();
   const [cases, setCases] = useState([]);
   const [selectedCase, setSelectedCase] = useState(null);
   const [prediction, setPrediction] = useState(null);
@@ -25,23 +27,43 @@ export default function TestCaseSampler({ onCaseSelect }) {
   const currentCase = cases.find(c => c.id === selectedCase);
 
   const handleRunTestCases = async () => {
-    if (!currentCase) return;
+    if (!loadedSample && !currentCase) return;
 
     setLoading(true);
     setError(null);
     setPrediction(null);
 
     try {
-      const response = await axios.post('http://127.0.0.1:8000/api/models/run-live-test', {
-        model,
-        case_id: currentCase.id,
-        sample: currentCase.data,
-      });
+      const response = loadedSample
+        ? await axios.post('http://127.0.0.1:8000/api/inference/live-sample', {
+            model,
+          })
+        : await axios.post('http://127.0.0.1:8000/api/models/run-live-test', {
+            model,
+            case_id: currentCase.id,
+            sample: currentCase.data,
+          });
       setPrediction(response.data);
       onCaseSelect?.(response.data);
     } catch (err) {
       console.error('Error running live test:', err);
-      setError('Could not run live test for the selected model and case.');
+      setError(loadedSample
+        ? 'Could not run live inference on the loaded sample data.'
+        : 'Could not run live test for the selected model and case.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleClearSamples = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      await clearLoadedSample();
+      setPrediction(null);
+    } catch (err) {
+      console.error('Error clearing samples:', err);
+      setError('Could not clear temporary sample data.');
     } finally {
       setLoading(false);
     }
@@ -94,10 +116,17 @@ export default function TestCaseSampler({ onCaseSelect }) {
           </div>
           <button
             onClick={handleRunTestCases}
-            disabled={!currentCase || loading}
+            disabled={(!loadedSample && !currentCase) || loading || checkingStatus}
             className="mt-4 inline-flex items-center justify-center rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
           >
-            {loading ? 'Running Test Cases...' : 'Run Test Cases'}
+            {loading ? 'Running Test Cases...' : loadedSample ? 'Run Test Cases on Loaded Sample' : 'Run Test Cases'}
+          </button>
+          <button
+            onClick={handleClearSamples}
+            disabled={!loadedSample || loading}
+            className="mt-3 inline-flex items-center justify-center rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Clear Samples
           </button>
           {error && (
             <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
@@ -105,6 +134,19 @@ export default function TestCaseSampler({ onCaseSelect }) {
             </div>
           )}
         </div>
+
+        {loadedSample ? (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+            Sample data loaded: {loadedSample.source_name}. Ready for out-of-sample testing.
+            <div className="mt-1 text-xs text-emerald-800">
+              Rows: {loadedSample.row_count} | Session: {loadedSample.session_id}
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            No sample data loaded. Go to Transactions, upload a file, then click "Load Sample Transaction".
+          </div>
+        )}
 
         {/* Case Selection Grid */}
         <div>
@@ -131,7 +173,7 @@ export default function TestCaseSampler({ onCaseSelect }) {
         </div>
 
         {/* Selected Case Details */}
-        {currentCase && (
+        {currentCase && !loadedSample && (
           <div className="bg-gray-50 p-4 rounded-lg border border-gray-200">
             <h3 className="font-bold text-gray-900 mb-3 flex items-center gap-2">
               <Database size={18} />
@@ -148,7 +190,7 @@ export default function TestCaseSampler({ onCaseSelect }) {
             </div>
 
             {/* Prediction Result */}
-            {prediction && (
+            {prediction && !loadedSample && (
               <div
                 className={`p-4 rounded-lg border-2 ${
                   prediction.predicted === prediction.true_label
@@ -183,8 +225,62 @@ export default function TestCaseSampler({ onCaseSelect }) {
           </div>
         )}
 
+        {prediction && loadedSample && (
+          <div className="bg-gray-50 p-4 rounded-lg border border-gray-200">
+            <h3 className="font-bold text-gray-900 mb-3 flex items-center gap-2">
+              <BarChart3 size={18} />
+              Out-of-Sample Inference Summary
+            </h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm mb-3">
+              <div className="bg-white p-2 rounded border border-gray-200">
+                <span className="text-gray-600">Rows:</span>
+                <span className="font-semibold text-gray-900 ml-1">{prediction.total_samples ?? 0}</span>
+              </div>
+              <div className="bg-white p-2 rounded border border-gray-200">
+                <span className="text-gray-600">Fraud Rows:</span>
+                <span className="font-semibold text-gray-900 ml-1">{prediction.fraud_rows ?? 0}</span>
+              </div>
+              <div className="bg-white p-2 rounded border border-gray-200">
+                <span className="text-gray-600">Cases Caught:</span>
+                <span className="font-semibold text-emerald-700 ml-1">{prediction.cases_caught_count ?? 0}</span>
+              </div>
+              <div className="bg-white p-2 rounded border border-gray-200">
+                <span className="text-gray-600">Cases Missed:</span>
+                <span className="font-semibold text-red-700 ml-1">{prediction.cases_missed_count ?? 0}</span>
+              </div>
+            </div>
+            <div className="text-xs text-gray-700 mb-2">
+              Model: {prediction.model} | Zone: {prediction.zone}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="rounded border border-emerald-200 bg-emerald-50 p-3">
+                <p className="text-xs font-semibold text-emerald-900 mb-1">Cases Caught</p>
+                <div className="max-h-40 overflow-auto text-xs text-emerald-900 space-y-1">
+                  {(prediction.cases_caught || []).slice(0, 8).map((item) => (
+                    <div key={`caught-${item.transaction_id}`}>
+                      {item.transaction_id} - {item.explanation}
+                    </div>
+                  ))}
+                  {(prediction.cases_caught || []).length === 0 && <div>None</div>}
+                </div>
+              </div>
+              <div className="rounded border border-red-200 bg-red-50 p-3">
+                <p className="text-xs font-semibold text-red-900 mb-1">Cases Missed</p>
+                <div className="max-h-40 overflow-auto text-xs text-red-900 space-y-1">
+                  {(prediction.cases_missed || []).slice(0, 8).map((item) => (
+                    <div key={`missed-${item.transaction_id}`}>
+                      {item.transaction_id} - {item.explanation}
+                    </div>
+                  ))}
+                  {(prediction.cases_missed || []).length === 0 && <div>None</div>}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Case Info Badge */}
-        {currentCase && (
+        {currentCase && !loadedSample && (
           <div className="bg-indigo-50 p-4 rounded-lg border border-indigo-200">
             <div className="text-sm text-gray-700">
               <p className="font-semibold mb-2">Fraud Indicators:</p>

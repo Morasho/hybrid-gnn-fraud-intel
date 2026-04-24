@@ -25,6 +25,7 @@ export default function TestCaseSampler({ onCaseSelect }) {
   }, []);
 
   const currentCase = cases.find(c => c.id === selectedCase);
+  const fraudTypeBreakdown = prediction?.fraud_type_breakdown || [];
 
   const handleRunTestCases = async () => {
     if (!loadedSample && !currentCase) return;
@@ -153,28 +154,30 @@ export default function TestCaseSampler({ onCaseSelect }) {
         )}
 
         {/* Case Selection Grid */}
-        <div>
-          <label className="block text-sm font-semibold text-gray-700 mb-3">
-            Select Test Case ({cases.length} available)
-          </label>
-          <div className="grid grid-cols-1 gap-2">
-            {cases.map((caseItem) => (
-              <button
-                key={caseItem.id}
-                onClick={() => setSelectedCase(caseItem.id)}
-                className={`p-4 rounded-lg border-2 text-left transition-all ${
-                  selectedCase === caseItem.id
-                    ? 'border-brandPrimary bg-indigo-50'
-                    : 'border-gray-200 bg-white hover:border-gray-300'
-                } ${getCaseColor(caseItem.description)}`}
-              >
-                <div className="font-bold text-gray-900">{caseItem.name}</div>
-                <div className="text-xs text-gray-600 mt-1">{caseItem.id}</div>
-                <div className="text-xs text-gray-500 mt-1">{caseItem.description}</div>
-              </button>
-            ))}
+        {!loadedSample && (
+          <div>
+            <label className="block text-sm font-semibold text-gray-700 mb-3">
+              Select Test Case ({cases.length} available)
+            </label>
+            <div className="grid grid-cols-1 gap-2">
+              {cases.map((caseItem) => (
+                <button
+                  key={caseItem.id}
+                  onClick={() => setSelectedCase(caseItem.id)}
+                  className={`p-4 rounded-lg border-2 text-left transition-all ${
+                    selectedCase === caseItem.id
+                      ? 'border-brandPrimary bg-indigo-50'
+                      : 'border-gray-200 bg-white hover:border-gray-300'
+                  } ${getCaseColor(caseItem.description)}`}
+                >
+                  <div className="font-bold text-gray-900">{caseItem.name}</div>
+                  <div className="text-xs text-gray-600 mt-1">{caseItem.id}</div>
+                  <div className="text-xs text-gray-500 mt-1">{caseItem.description}</div>
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Selected Case Details */}
         {currentCase && !loadedSample && (
@@ -235,10 +238,14 @@ export default function TestCaseSampler({ onCaseSelect }) {
               <BarChart3 size={18} />
               Out-of-Sample Inference Summary
             </h3>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm mb-3">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-sm mb-3">
               <div className="bg-white p-2 rounded border border-gray-200">
                 <span className="text-gray-600">Rows:</span>
                 <span className="font-semibold text-gray-900 ml-1">{prediction.total_samples ?? 0}</span>
+              </div>
+              <div className="bg-white p-2 rounded border border-gray-200">
+                <span className="text-gray-600">Total Fraud Cases:</span>
+                <span className="font-semibold text-gray-900 ml-1">{prediction.total_fraud_cases ?? prediction.fraud_rows ?? 0}</span>
               </div>
               <div className="bg-white p-2 rounded border border-gray-200">
                 <span className="text-gray-600">Fraud Rows:</span>
@@ -260,30 +267,38 @@ export default function TestCaseSampler({ onCaseSelect }) {
                 <div>Feature columns sent to predict(): {prediction.predict_feature_count}</div>
               ) : null}
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div className="rounded border border-emerald-200 bg-emerald-50 p-3">
-                <p className="text-xs font-semibold text-emerald-900 mb-1">Cases Caught</p>
-                <div className="max-h-40 overflow-auto text-xs text-emerald-900 space-y-1">
-                  {(prediction.cases_caught || []).slice(0, 8).map((item) => (
-                    <div key={`caught-${item.transaction_id}`}>
-                      {item.transaction_id} - {item.explanation}
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {fraudTypeBreakdown.map((group) => (
+                <div key={group.fraud_type} className="rounded border border-gray-200 bg-white p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-sm font-semibold text-gray-900">{group.fraud_type}</p>
+                    <span className="text-xs text-gray-500">Fraud Cases: {group.total_fraud_cases}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs mb-2">
+                    <div className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1 text-emerald-800">
+                      Caught: {group.cases_caught_count}
                     </div>
-                  ))}
-                  {(prediction.cases_caught || []).length === 0 && <div>None</div>}
-                </div>
-              </div>
-              <div className="rounded border border-red-200 bg-red-50 p-3">
-                <p className="text-xs font-semibold text-red-900 mb-1">Cases Missed</p>
-                <div className="max-h-40 overflow-auto text-xs text-red-900 space-y-1">
-                  {(prediction.cases_missed || []).slice(0, 8).map((item) => (
-                    <div key={`missed-${item.transaction_id}`}>
-                      {item.transaction_id} - {item.explanation}
+                    <div className="rounded border border-red-200 bg-red-50 px-2 py-1 text-red-800">
+                      Missed: {group.cases_missed_count}
                     </div>
-                  ))}
-                  {(prediction.cases_missed || []).length === 0 && <div>None</div>}
+                  </div>
+                  <div className="text-xs text-gray-700 space-y-1 max-h-24 overflow-auto">
+                    {(group.cases_missed || []).slice(0, 2).map((item) => (
+                      <div key={`group-missed-${group.fraud_type}-${item.transaction_id}`}>{item.explanation}</div>
+                    ))}
+                    {(group.cases_missed || []).length === 0 && (group.cases_caught || []).slice(0, 1).map((item) => (
+                      <div key={`group-caught-${group.fraud_type}-${item.transaction_id}`}>{item.explanation}</div>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              ))}
             </div>
+
+            {fraudTypeBreakdown.length === 0 && (
+              <div className="rounded border border-gray-200 bg-white p-3 text-xs text-gray-600">
+                No fraud-type breakdown was returned for this run.
+              </div>
+            )}
           </div>
         )}
 

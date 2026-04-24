@@ -786,7 +786,9 @@ def apply_ai_analyst(amount: float, velocity: int, risk_score: float) -> tuple[s
 
 def _parse_uploaded_sample_file(content: bytes, filename: str) -> pd.DataFrame:
     if filename.endswith('.csv'):
-        return pd.read_csv(io.BytesIO(content))
+        # Read only the first 50 rows for schema validation / preview.
+        # The full file is stored on disk separately via _store_raw_csv_bytes.
+        return pd.read_csv(io.BytesIO(content), nrows=50)
 
     if filename.endswith('.pdf'):
         try:
@@ -820,6 +822,41 @@ def _cleanup_sample_file(path_value: str | None) -> None:
             sample_path.unlink()
     except Exception:
         pass
+
+
+def _store_raw_csv_bytes(content: bytes, source_name: str) -> dict[str, Any]:
+    """Write raw CSV bytes directly to disk without parsing the full file."""
+    session_id = f"sample_{int(datetime.now().timestamp() * 1000)}"
+    sample_path = TEMP_SAMPLE_DIR / f"{session_id}.csv"
+    sample_path.write_bytes(content)
+
+    # Count rows cheaply without loading into pandas
+    row_count = max(0, content.count(b"\n") - 1)  # subtract header row
+
+    # Read just the header for column metadata
+    header_df = pd.read_csv(io.BytesIO(content), nrows=0)
+    normalized_cols = list(_normalize_columns(header_df).columns)
+
+    sample_meta = {
+        "session_id": session_id,
+        "source_name": source_name,
+        "row_count": row_count,
+        "columns": list(header_df.columns),
+        "normalized_columns": normalized_cols,
+        "loaded_at": datetime.now().isoformat(),
+        "path": str(sample_path),
+    }
+
+    with TEMP_SAMPLE_LOCK:
+        active_session_id = TEMP_SAMPLE_CACHE.get("active_session_id")
+        if active_session_id and active_session_id in TEMP_SAMPLE_CACHE["samples"]:
+            previous = TEMP_SAMPLE_CACHE["samples"].pop(active_session_id)
+            _cleanup_sample_file(previous.get("path"))
+
+        TEMP_SAMPLE_CACHE["samples"][session_id] = sample_meta
+        TEMP_SAMPLE_CACHE["active_session_id"] = session_id
+
+    return sample_meta
 
 
 def _store_temporary_sample(df: pd.DataFrame, source_name: str) -> dict[str, Any]:
@@ -2090,17 +2127,25 @@ async def load_temporary_sample(file: UploadFile = File(...)):
         content = await file.read()
         filename = (file.filename or "uploaded_file").lower()
 
-        raw_df = _parse_uploaded_sample_file(content, filename)
-        normalized_df = ensure_live_sample_schema(raw_df)
-        standardized_preview = standardize_transactions_df(normalized_df)
-        sample_meta = _store_temporary_sample(raw_df, filename)
+        if filename.endswith('.csv'):
+            # Fast path: validate schema on 50-row slice, write raw bytes to disk
+            preview_df = _parse_uploaded_sample_file(content, filename)  # already nrows=50
+            normalized_df = ensure_live_sample_schema(preview_df)
+            standardized_preview = standardize_transactions_df(normalized_df)
+            sample_meta = _store_raw_csv_bytes(content, filename)
+        else:
+            # PDF / Word: parse full text into a small synthesised DF
+            raw_df = _parse_uploaded_sample_file(content, filename)
+            normalized_df = ensure_live_sample_schema(raw_df)
+            standardized_preview = standardize_transactions_df(normalized_df.head(50))
+            sample_meta = _store_temporary_sample(raw_df, filename)
 
         return {
             "status": "loaded",
             "sample_meta": {
                 key: value for key, value in sample_meta.items() if key != "path"
             },
-            "transactions": standardized_preview.head(50).to_dict(orient="records"),
+            "transactions": standardized_preview.to_dict(orient="records"),
             "standardized_columns": STANDARD_COLUMNS,
             "required_columns": LIVE_SAMPLE_REQUIRED_COLUMNS,
         }

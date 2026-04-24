@@ -166,7 +166,7 @@ export default function Transactions() {
 
       const response = await axios.post('http://127.0.0.1:8000/api/samples/load', formDataUpload, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 30000
+        timeout: 120000
       });
 
       if (!response.data.transactions || response.data.transactions.length === 0) {

@@ -47,9 +47,13 @@ export default function TestCaseSampler({ onCaseSelect }) {
       onCaseSelect?.(response.data);
     } catch (err) {
       console.error('Error running live test:', err);
-      setError(loadedSample
+      const detail = err.response?.data?.detail;
+      const backendMessage = typeof detail === 'string'
+        ? detail
+        : detail?.message || (detail?.missing_columns ? `Missing columns: ${detail.missing_columns.join(', ')}` : null);
+      setError(backendMessage || (loadedSample
         ? 'Could not run live inference on the loaded sample data.'
-        : 'Could not run live test for the selected model and case.');
+        : 'Could not run live test for the selected model and case.'));
     } finally {
       setLoading(false);
     }
@@ -249,8 +253,12 @@ export default function TestCaseSampler({ onCaseSelect }) {
                 <span className="font-semibold text-red-700 ml-1">{prediction.cases_missed_count ?? 0}</span>
               </div>
             </div>
-            <div className="text-xs text-gray-700 mb-2">
-              Model: {prediction.model} | Zone: {prediction.zone}
+            <div className="text-xs text-gray-700 mb-2 space-y-1">
+              <div>Model: {prediction.model} | Zone: {prediction.zone}</div>
+              <div>Artifact: {prediction.model_source || 'unknown'}{prediction.artifact_path ? ` | Path: ${prediction.artifact_path}` : ''}</div>
+              {prediction.predict_feature_count ? (
+                <div>Feature columns sent to predict(): {prediction.predict_feature_count}</div>
+              ) : null}
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div className="rounded border border-emerald-200 bg-emerald-50 p-3">

@@ -1,8 +1,11 @@
 import { useState } from 'react';
 import axios from 'axios';
 import { ShieldAlert, ShieldCheck, Activity, Search, Upload, BarChart3, Zap, AlertCircle, CheckCircle, X } from 'lucide-react';
+import { useSampleData } from '../context/SampleDataContext';
 
 export default function Transactions() {
+  const { setLoadedSample } = useSampleData();
+
   // State to hold the form data
   const [formData, setFormData] = useState({
     transaction_id: 'TXN_' + Math.floor(Math.random() * 1000000),
@@ -14,11 +17,13 @@ export default function Transactions() {
   });
 
   // File upload state
+  const [selectedUploadFile, setSelectedUploadFile] = useState(null);
   const [uploadedFile, setUploadedFile] = useState(null);
   const [extractedTransactions, setExtractedTransactions] = useState([]);
   const [selectedUploadedTx, setSelectedUploadedTx] = useState(null);
   const [uploadedTxComparison, setUploadedTxComparison] = useState(null);
   const [showComparison, setShowComparison] = useState(false);
+  const [sampleLoading, setSampleLoading] = useState(false);
 
   // State to hold the predictions
   const [prediction, setPrediction] = useState(null);
@@ -101,7 +106,7 @@ export default function Transactions() {
     }
   };
 
-  // Handle file upload with improved error handling
+  // Select file locally first, then load it explicitly with "Load Sample Transaction".
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -124,40 +129,54 @@ export default function Transactions() {
       return;
     }
 
+    setSelectedUploadFile(file);
+    setUploadedFile(null);
+    setExtractedTransactions([]);
+    setSelectedUploadedTx(null);
+    setUploadedTxComparison(null);
+    setApiHealthy(true);
+  };
+
+  const handleLoadSampleTransaction = async () => {
+    if (!selectedUploadFile) {
+      setError('Please choose a CSV, PDF, or Word file first.');
+      return;
+    }
+
     const formDataUpload = new FormData();
-    formDataUpload.append('file', file);
+    formDataUpload.append('file', selectedUploadFile);
 
     try {
-      setLoading(true);
+      setSampleLoading(true);
       setError(null);
       setErrorDetails(null);
-      
-      const response = await axios.post('http://127.0.0.1:8000/upload-transaction-file', formDataUpload, {
+
+      const response = await axios.post('http://127.0.0.1:8000/api/samples/load', formDataUpload, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 30000 // 30 second timeout
+        timeout: 30000
       });
-      
+
       if (!response.data.transactions || response.data.transactions.length === 0) {
         setError('No transactions found in file.');
         setErrorDetails('Please ensure the file contains valid transaction data.');
         return;
       }
-      
-      setUploadedFile(response.data?.dataset?.source_name || file.name);
+
+      const sampleMeta = response.data.sample_meta || null;
+      setUploadedFile(sampleMeta?.source_name || selectedUploadFile.name);
       setExtractedTransactions(response.data.transactions || []);
       setSelectedUploadedTx((response.data.transactions || [])[0] || null);
-      if (response.data?.dataset) {
-        localStorage.setItem('activeDatasetMeta', JSON.stringify(response.data.dataset));
-        window.dispatchEvent(new Event('dataset-updated'));
+      if (sampleMeta) {
+        setLoadedSample(sampleMeta);
       }
       setApiHealthy(true);
     } catch (err) {
       const { message, details } = parseErrorMessage(err);
       setError(message);
       setErrorDetails(details);
-      console.error('File upload error:', err);
+      console.error('Sample load error:', err);
     } finally {
-      setLoading(false);
+      setSampleLoading(false);
     }
   };
 
@@ -357,7 +376,7 @@ export default function Transactions() {
           Extract Transaction Data from File
         </h2>
         
-        {loading && (
+        {sampleLoading && (
           <div className="mb-4 flex items-center gap-2 text-blue-600">
             <Activity size={16} className="animate-spin" />
             <p className="text-sm font-medium">Processing file...</p>
@@ -371,14 +390,28 @@ export default function Transactions() {
             onChange={handleFileUpload}
             className="hidden"
             id="file-upload"
-            disabled={loading}
+            disabled={sampleLoading}
           />
-          <label htmlFor="file-upload" className={`cursor-pointer block ${loading ? 'opacity-50' : ''}`}>
+          <label htmlFor="file-upload" className={`cursor-pointer block ${sampleLoading ? 'opacity-50' : ''}`}>
             <Upload size={32} className="mx-auto mb-3 text-gray-400" />
             <p className="text-gray-700 font-medium">Upload CSV, PDF, or Word doc</p>
             <p className="text-sm text-gray-500 mt-1">Click to browse or drag and drop (Max 10MB)</p>
           </label>
         </div>
+
+        <button
+          onClick={handleLoadSampleTransaction}
+          disabled={!selectedUploadFile || sampleLoading}
+          className="mt-4 w-full rounded-lg bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
+        >
+          {sampleLoading ? 'Loading Sample Transaction...' : 'Load Sample Transaction'}
+        </button>
+
+        {selectedUploadFile && !uploadedFile && (
+          <div className="mt-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
+            File selected: {selectedUploadFile.name}. Click "Load Sample Transaction" to parse and stage it for Zone 2 testing.
+          </div>
+        )}
 
         {uploadedFile && (
           <div className="mt-4 p-4 bg-green-50 rounded-lg border border-green-200">

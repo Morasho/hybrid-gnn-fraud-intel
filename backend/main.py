@@ -9,6 +9,7 @@ import numpy as np
 import xgboost as xgb
 import pickle
 import os
+import torch
 import sqlite3
 import io
 import re
@@ -21,6 +22,7 @@ import importlib
 from pathlib import Path
 from typing import Any, Literal, Optional
 from threading import Lock
+from sklearn.preprocessing import OrdinalEncoder
 
 # 1. INITIALIZE APP & CONNECTIONS 
 app = FastAPI(title="M-Pesa Fraud Intelligence API", version="1.0")
@@ -97,20 +99,49 @@ URI = "neo4j://localhost:7687"
 AUTH = ("neo4j", "12345678")
 driver = GraphDatabase.driver(URI, auth=AUTH)
 
-# Load the trained Hybrid Meta-Learner (Tier 1)
+# Load the trained Tier 1 inference artifacts
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl")
+MODEL_ARTIFACT_PATHS = {
+    "stacked_hybrid": os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl"),
+    "xgboost": os.path.join(BASE_DIR, "models", "saved", "baseline_xgboost.pkl"),
+    "gnn": os.path.join(BASE_DIR, "models", "saved", "gnn_edge_classifier.pt"),
+}
+MODEL_LOAD_HINTS = {
+    "stacked_hybrid": "python ml_pipeline/models/stacked_hybrid.py",
+    "xgboost": "python ml_pipeline/models/baseline_xgboost.py",
+    "gnn": "python ml_pipeline/models/evaluate_gnn.py",
+}
+MODEL_CACHE: dict[str, Any] = {}
+USER_EMBEDDINGS_PATH = os.path.join(BASE_DIR, "data", "processed", "user_embeddings.csv")
 
-hybrid_model = None
-try:
-    with open(MODEL_PATH, "rb") as f:
-        hybrid_model = pickle.load(f)
-    print(f"✅ SUCCESS: AI Brain loaded from {MODEL_PATH}")
-except FileNotFoundError:
-    print(f"❌ ERROR: Model file not found at {MODEL_PATH}")
-    print(f"   Please run: python ml_pipeline/models/stacked_hybrid.py")
-except Exception as e:
-    print(f"❌ ERROR: Failed to load model: {str(e)}")
+
+class LiveGNNEdgeClassifier(torch.nn.Module):
+    def __init__(self, hidden_channels: int):
+        super().__init__()
+        self.lin1 = torch.nn.Linear(2 * hidden_channels, hidden_channels)
+        self.lin2 = torch.nn.Linear(hidden_channels, 1)
+
+    def forward(self, edge_features: torch.Tensor) -> torch.Tensor:
+        hidden = self.lin1(edge_features).relu()
+        return self.lin2(hidden).view(-1)
+
+
+def load_pickle_artifact(model_type: str) -> Any | None:
+    artifact_path = MODEL_ARTIFACT_PATHS[model_type]
+    try:
+        with open(artifact_path, "rb") as f:
+            model = pickle.load(f)
+        MODEL_CACHE[model_type] = model
+        print(f"SUCCESS: Loaded {model_type} artifact from {artifact_path}")
+        return model
+    except FileNotFoundError:
+        print(f"ERROR: {model_type} artifact not found at {artifact_path}")
+    except Exception as e:
+        print(f"ERROR: Failed to load {model_type} artifact: {str(e)}")
+    return None
+
+
+hybrid_model = load_pickle_artifact("stacked_hybrid")
 
 
 #  SQLITE DATABASE INITIALIZATION 
@@ -173,6 +204,8 @@ STANDARD_COLUMNS = [
 COLUMN_ALIASES = {
     "tx_id": "transaction_id",
     "transactionid": "transaction_id",
+    "amount_kes": "amount",
+    "velocity_24hr": "transactions_last_24hr",
     "sender": "sender_id",
     "source": "sender_id",
     "receiver": "receiver_id",
@@ -184,8 +217,35 @@ COLUMN_ALIASES = {
     "count_24h": "transactions_last_24hr",
     "label": "is_fraud",
     "fraud_label": "is_fraud",
+    "fraud_type": "fraud_scenario",
     "scenario": "fraud_scenario",
 }
+
+LIVE_SAMPLE_CATEGORICAL_COLUMNS = ["device_id", "agent_id", "sender_id", "receiver_id"]
+LIVE_SAMPLE_TARGET_COLUMNS = ["is_fraud", "fraud_scenario", "transaction_id"]
+LIVE_SAMPLE_REQUIRED_COLUMNS = [
+    "transaction_id",
+    "sender_id",
+    "receiver_id",
+    "amount",
+    "transactions_last_24hr",
+    "hour",
+    "device_id",
+    "agent_id",
+    "is_fraud",
+    "fraud_scenario",
+]
+TABULAR_MODEL_FEATURES = [
+    "amount",
+    "num_accounts_linked",
+    "shared_device_flag",
+    "avg_transaction_amount",
+    "transaction_frequency",
+    "num_unique_recipients",
+    "transactions_last_24hr",
+    "round_amount_flag",
+    "night_activity_flag",
+]
 
 SCENARIO_NAME_MAP = {
     "fraud_ring": "Agent Reversal Scam Ring",
@@ -738,6 +798,7 @@ def _store_temporary_sample(df: pd.DataFrame, source_name: str) -> dict[str, Any
         "source_name": source_name,
         "row_count": int(len(df)),
         "columns": list(df.columns),
+        "normalized_columns": list(_normalize_columns(df.copy()).columns),
         "loaded_at": datetime.now().isoformat(),
         "path": str(sample_path),
     }
@@ -772,7 +833,7 @@ def _load_active_sample_df() -> tuple[pd.DataFrame, dict[str, Any]]:
         raise HTTPException(status_code=404, detail="Temporary sample file could not be found")
 
     sample_df = pd.read_csv(sample_path)
-    return standardize_transactions_df(sample_df), sample_meta
+    return sample_df, sample_meta
 
 
 def _clear_temporary_sample_cache() -> dict[str, Any]:
@@ -789,26 +850,270 @@ def _clear_temporary_sample_cache() -> dict[str, Any]:
     return {"status": "cleared"}
 
 
+def ensure_live_sample_schema(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = _normalize_columns(df.copy())
+    missing_columns = [column for column in LIVE_SAMPLE_REQUIRED_COLUMNS if column not in normalized_df.columns]
+    if missing_columns:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Uploaded sample is missing required columns for live inference.",
+                "missing_columns": missing_columns,
+                "required_columns": LIVE_SAMPLE_REQUIRED_COLUMNS,
+                "received_columns": list(normalized_df.columns),
+            },
+        )
+    return normalized_df
+
+
+def get_inference_artifact_path(model: str) -> str:
+    return MODEL_ARTIFACT_PATHS[model]
+
+
+def load_inference_model(model: str) -> tuple[Any, str]:
+    if model == "gnn":
+        return load_gnn_inference_components()
+
+    cached_model = MODEL_CACHE.get(model)
+    if cached_model is not None:
+        return cached_model, get_inference_artifact_path(model)
+
+    loaded_model = load_pickle_artifact(model)
+    if loaded_model is None:
+        artifact_path = get_inference_artifact_path(model)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": f"{model} artifact is missing for live inference.",
+                "missing_artifact": artifact_path,
+                "resolution": f"Run {MODEL_LOAD_HINTS[model]} to export the artifact, then retry.",
+            },
+        )
+
+    return loaded_model, get_inference_artifact_path(model)
+
+
+def load_user_embeddings() -> pd.DataFrame:
+    cached_embeddings = MODEL_CACHE.get("gnn_user_embeddings")
+    if cached_embeddings is not None:
+        return cached_embeddings
+
+    if not os.path.exists(USER_EMBEDDINGS_PATH):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "GNN user embeddings are missing for live inference.",
+                "missing_artifact": USER_EMBEDDINGS_PATH,
+                "resolution": "Run ml_pipeline/models/gnn_embeddings.py to export user_embeddings.csv.",
+            },
+        )
+
+    embeddings_df = pd.read_csv(USER_EMBEDDINGS_PATH)
+    user_id_column = "user_id" if "user_id" in embeddings_df.columns else embeddings_df.columns[0]
+    embeddings_df = embeddings_df.set_index(user_id_column)
+    MODEL_CACHE["gnn_user_embeddings"] = embeddings_df
+    return embeddings_df
+
+
+def load_gnn_inference_components() -> tuple[LiveGNNEdgeClassifier, str]:
+    cached_classifier = MODEL_CACHE.get("gnn_classifier")
+    artifact_path = get_inference_artifact_path("gnn")
+    if cached_classifier is not None:
+        return cached_classifier, artifact_path
+
+    if not os.path.exists(artifact_path):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Pure GNN live inference checkpoint is missing.",
+                "missing_artifact": artifact_path,
+                "resolution": f"Run {MODEL_LOAD_HINTS['gnn']} to export the GNN checkpoint.",
+            },
+        )
+
+    checkpoint = torch.load(artifact_path, map_location="cpu", weights_only=False)
+    embedding_dim = int(checkpoint.get("embedding_dim", 64))
+    classifier = LiveGNNEdgeClassifier(hidden_channels=embedding_dim)
+    classifier_state = {
+        key.replace("classifier.", "", 1): value
+        for key, value in checkpoint["state_dict"].items()
+        if key.startswith("classifier.")
+    }
+    classifier.load_state_dict(classifier_state)
+    classifier.eval()
+    MODEL_CACHE["gnn_classifier"] = classifier
+    return classifier, artifact_path
+
+
+def run_gnn_live_inference(processed_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, str]:
+    classifier, artifact_path = load_gnn_inference_components()
+    embeddings_df = load_user_embeddings()
+    embedding_dim = classifier.lin2.in_features
+    zero_vector = np.zeros(embedding_dim, dtype=np.float32)
+
+    edge_rows = []
+    for _, row in processed_df.iterrows():
+        sender_id = str(row.get("sender_id", "UNKNOWN_SENDER"))
+        receiver_id = str(row.get("receiver_id", "UNKNOWN_RECEIVER"))
+        sender_vector = embeddings_df.loc[sender_id].to_numpy(dtype=np.float32) if sender_id in embeddings_df.index else zero_vector
+        receiver_vector = embeddings_df.loc[receiver_id].to_numpy(dtype=np.float32) if receiver_id in embeddings_df.index else zero_vector
+        edge_rows.append(np.concatenate([sender_vector, receiver_vector]))
+
+    edge_tensor = torch.tensor(np.vstack(edge_rows), dtype=torch.float32)
+    with torch.no_grad():
+        logits = classifier(edge_tensor)
+        probabilities = torch.sigmoid(logits).cpu().numpy()
+    predictions = (probabilities >= 0.5).astype(int)
+    return probabilities, predictions, artifact_path
+
+
+def align_frame_to_model_features(frame: pd.DataFrame, model_object: Any) -> pd.DataFrame:
+    expected_features = [str(feature) for feature in getattr(model_object, "feature_names_in_", [])]
+    if not expected_features:
+        return frame.copy()
+
+    missing_features = [feature for feature in expected_features if feature not in frame.columns]
+    if missing_features:
+        zero_frame = pd.DataFrame(0, index=frame.index, columns=missing_features)
+        frame = pd.concat([frame, zero_frame], axis=1)
+
+    return frame[expected_features].copy()
+
+
+def prepare_live_sample_inference_frame(df: pd.DataFrame) -> dict[str, Any]:
+    processed_df = ensure_live_sample_schema(df)
+
+    processed_df["transaction_id"] = processed_df["transaction_id"].astype(str).fillna("UNKNOWN_TX")
+    processed_df["sender_id"] = processed_df["sender_id"].astype(str).fillna("UNKNOWN_SENDER")
+    processed_df["receiver_id"] = processed_df["receiver_id"].astype(str).fillna("UNKNOWN_RECEIVER")
+    processed_df["device_id"] = processed_df["device_id"].astype(str).fillna("UNKNOWN_DEVICE")
+    processed_df["agent_id"] = processed_df["agent_id"].astype(str).fillna("UNKNOWN_AGENT")
+    processed_df["fraud_scenario"] = (
+        processed_df["fraud_scenario"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({"": "normal", "nan": "normal"})
+    )
+
+    processed_df["amount"] = pd.to_numeric(processed_df["amount"], errors="coerce").fillna(0.0)
+    processed_df["transactions_last_24hr"] = pd.to_numeric(processed_df["transactions_last_24hr"], errors="coerce").fillna(0).astype(int)
+    processed_df["hour"] = pd.to_numeric(processed_df["hour"], errors="coerce").fillna(12).clip(0, 23).astype(int)
+    processed_df["is_fraud"] = pd.to_numeric(processed_df["is_fraud"], errors="coerce").fillna(0).astype(int)
+
+    categorical_frame = processed_df[LIVE_SAMPLE_CATEGORICAL_COLUMNS].astype(str)
+    encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    encoded_values = encoder.fit_transform(categorical_frame)
+    encoded_columns = []
+    for index, column in enumerate(LIVE_SAMPLE_CATEGORICAL_COLUMNS):
+        encoded_column = f"{column}_encoded"
+        processed_df[encoded_column] = encoded_values[:, index].astype(int)
+        encoded_columns.append(encoded_column)
+
+    device_account_links = processed_df.groupby("device_id")["sender_id"].transform("nunique")
+    agent_account_links = processed_df.groupby("agent_id")["sender_id"].transform("nunique")
+    processed_df["num_accounts_linked"] = np.maximum(np.maximum(device_account_links, agent_account_links), 1).astype(int)
+    processed_df["shared_device_flag"] = (device_account_links > 1).astype(int)
+    processed_df["avg_transaction_amount"] = processed_df.groupby("sender_id")["amount"].transform("mean").fillna(processed_df["amount"].mean())
+    processed_df["transaction_frequency"] = processed_df["transactions_last_24hr"].astype(float)
+    processed_df["num_unique_recipients"] = processed_df.groupby("sender_id")["receiver_id"].transform("nunique").clip(lower=1).astype(int)
+    processed_df["round_amount_flag"] = (processed_df["amount"] % 100 == 0).astype(int)
+    processed_df["night_activity_flag"] = (processed_df["hour"] < 5).astype(int)
+
+    for column in ["triad_closure_score", "pagerank_score", "in_degree", "out_degree", "cycle_indicator"]:
+        if column not in processed_df.columns:
+            processed_df[column] = 0
+    processed_df["triad_closure_score"] = pd.to_numeric(processed_df["triad_closure_score"], errors="coerce").fillna(0.0)
+    processed_df["pagerank_score"] = pd.to_numeric(processed_df["pagerank_score"], errors="coerce").fillna(0.0)
+    processed_df["in_degree"] = pd.to_numeric(processed_df["in_degree"], errors="coerce").fillna(0).astype(int)
+    processed_df["out_degree"] = pd.to_numeric(processed_df["out_degree"], errors="coerce").fillna(0).astype(int)
+    processed_df["cycle_indicator"] = pd.to_numeric(processed_df["cycle_indicator"], errors="coerce").fillna(0).astype(int)
+
+    hybrid_frame = prepare_hybrid_feature_frame(processed_df)
+    dropped_columns = LIVE_SAMPLE_TARGET_COLUMNS + LIVE_SAMPLE_CATEGORICAL_COLUMNS + encoded_columns
+
+    return {
+        "processed_df": processed_df,
+        "hybrid_frame": hybrid_frame,
+        "tabular_frame": processed_df[TABULAR_MODEL_FEATURES].copy(),
+        "encoded_columns": encoded_columns,
+        "dropped_columns": dropped_columns,
+        "required_columns": LIVE_SAMPLE_REQUIRED_COLUMNS,
+    }
+
+
+def build_live_sample_explanation(sample: dict[str, Any], predicted: int, true_label: int, model: str) -> str:
+    transaction_id = sample.get("transaction_id", "UNKNOWN_TX")
+    amount = float(sample.get("amount", 0.0))
+    velocity = int(sample.get("transactions_last_24hr", 0))
+    hour = int(sample.get("hour", 12))
+    shared_device_flag = int(sample.get("shared_device_flag", 0))
+    recipients = int(sample.get("num_unique_recipients", 1))
+
+    reason_bits = []
+    if velocity >= 5:
+        reason_bits.append(f"Velocity ({velocity})")
+    if amount >= 10000:
+        reason_bits.append(f"Amount ({amount:.0f})")
+    if hour < 5:
+        reason_bits.append(f"Hour ({hour})")
+    if shared_device_flag == 1:
+        reason_bits.append("shared device activity")
+    if recipients >= 4:
+        reason_bits.append(f"fan-out recipients ({recipients})")
+    if not reason_bits:
+        reason_bits.append(f"Amount ({amount:.0f}) and Velocity ({velocity})")
+    joined_reasons = ", ".join(reason_bits)
+
+    if predicted == 1 and true_label == 1:
+        return f"{transaction_id} - Flagged by {model}. High risk identified: {joined_reasons}."
+    if predicted == 0 and true_label == 1:
+        return f"{transaction_id} - Missed by {model}. Transaction with {joined_reasons} slipped through despite Label=1."
+    if predicted == 1 and true_label == 0:
+        return f"{transaction_id} - False positive by {model}. Flagged due to {joined_reasons} although Label=0."
+    return f"{transaction_id} - Cleared by {model}. Observed {joined_reasons} and matched Label=0."
+
+
 def _infer_live_sample_rows(model: str, df: pd.DataFrame) -> dict[str, Any]:
+    prepared = prepare_live_sample_inference_frame(df)
+    processed_df = prepared["processed_df"]
+    encoded_columns = prepared["encoded_columns"]
+    dropped_columns = prepared["dropped_columns"]
+
+    if model == "gnn":
+        probabilities, predictions, artifact_path = run_gnn_live_inference(processed_df)
+        feature_frame = processed_df[["sender_id", "receiver_id"]].copy()
+    else:
+        inference_model, artifact_path = load_inference_model(model)
+        if model == "xgboost":
+            feature_frame = align_frame_to_model_features(prepared["tabular_frame"], inference_model)
+        else:
+            feature_frame = align_frame_to_model_features(prepared["hybrid_frame"], inference_model)
+        probabilities = inference_model.predict_proba(feature_frame)[:, 1]
+        predictions = inference_model.predict(feature_frame)
+
     results = []
-    for _, row in df.iterrows():
+    for index, (_, row) in enumerate(processed_df.iterrows()):
         sample = row.to_dict()
-        score, predicted, explanation = score_live_test_sample(model, sample)
         true_label = int(sample.get("is_fraud", 0))
+        predicted = int(predictions[index])
+        score = float(probabilities[index])
         results.append(
             {
                 "transaction_id": sample.get("transaction_id", "UNKNOWN_TX"),
                 "sender_id": sample.get("sender_id", "UNKNOWN_SENDER"),
                 "receiver_id": sample.get("receiver_id", "UNKNOWN_RECEIVER"),
                 "amount": float(sample.get("amount", 0.0)),
+                "velocity_24hr": int(sample.get("transactions_last_24hr", 0)),
+                "hour": int(sample.get("hour", 12)),
                 "true_label": true_label,
-                "predicted": int(predicted),
-                "confidence": round(float(score), 4),
+                "predicted": predicted,
+                "confidence": round(score, 4),
                 "caught": bool(predicted == 1 and true_label == 1),
                 "missed": bool(predicted == 0 and true_label == 1),
                 "correct": bool(predicted == true_label),
                 "fraud_scenario": str(sample.get("fraud_scenario", "normal")),
-                "explanation": explanation,
+                "explanation": build_live_sample_explanation(sample, predicted, true_label, model),
             }
         )
 
@@ -824,6 +1129,12 @@ def _infer_live_sample_rows(model: str, df: pd.DataFrame) -> dict[str, Any]:
         "cases_caught": cases_caught,
         "cases_missed": cases_missed,
         "results_preview": results[:20],
+        "model_source": os.path.basename(artifact_path),
+        "artifact_path": artifact_path,
+        "encoded_columns": encoded_columns,
+        "dropped_before_predict": dropped_columns,
+        "predict_feature_count": int(feature_frame.shape[1]),
+        "required_columns": prepared["required_columns"],
     }
 
 # 4. API ENDPOINTS 
@@ -1574,24 +1885,26 @@ async def upload_transaction_file(file: UploadFile = File(...)):
 @app.post("/api/samples/load")
 async def load_temporary_sample(file: UploadFile = File(...)):
     """
-    Parse a CSV/PDF/Word upload into standardized tabular transactions and cache it temporarily.
-    This path is isolated from historical baseline metrics and training datasets.
+    Parse a CSV/PDF/Word upload and cache the raw uploaded rows temporarily.
+    Zone 2 inference later performs strict schema validation and model-specific preprocessing.
     """
     try:
         content = await file.read()
         filename = (file.filename or "uploaded_file").lower()
 
         raw_df = _parse_uploaded_sample_file(content, filename)
-        standardized_df = standardize_transactions_df(raw_df)
-        sample_meta = _store_temporary_sample(standardized_df, filename)
+        normalized_df = ensure_live_sample_schema(raw_df)
+        standardized_preview = standardize_transactions_df(normalized_df)
+        sample_meta = _store_temporary_sample(raw_df, filename)
 
         return {
             "status": "loaded",
             "sample_meta": {
                 key: value for key, value in sample_meta.items() if key != "path"
             },
-            "transactions": standardized_df.head(50).to_dict(orient="records"),
+            "transactions": standardized_preview.head(50).to_dict(orient="records"),
             "standardized_columns": STANDARD_COLUMNS,
+            "required_columns": LIVE_SAMPLE_REQUIRED_COLUMNS,
         }
     except HTTPException:
         raise

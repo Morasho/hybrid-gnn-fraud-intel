@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 import pandas as pd
+
 import numpy as np
 import xgboost as xgb
+
 import pickle
 import os
 import sqlite3
@@ -12,10 +14,12 @@ import io
 import re
 import sys
 from datetime import datetime
+
 import subprocess
 import json
 import tempfile
 from pathlib import Path
+
 from typing import Any
 
 # 1. INITIALIZE APP & CONNECTIONS 
@@ -38,14 +42,30 @@ driver = GraphDatabase.driver(URI, auth=AUTH)
 
 # Load the trained Hybrid Meta-Learner (Tier 1)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl")
+MODEL_CANDIDATES = [
+    os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl"),
+    os.path.join(BASE_DIR, "ml_pipeline", "models", "saved", "hybrid_xgboost.pkl"),
+]
 
-try:
-    with open(MODEL_PATH, "rb") as f:
-        hybrid_model = pickle.load(f)
-    print(f"✅ SUCCESS: AI Brain loaded from {MODEL_PATH}")
-except FileNotFoundError:
-    print(f"Warning: Model file not found at {MODEL_PATH}. API will fail on prediction.")
+
+def load_hybrid_model() -> tuple[Any | None, str | None]:
+    """Loads the trained model from known locations, if present."""
+    for path in MODEL_CANDIDATES:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f), path
+        except Exception as e:
+            print(f"Warning: Could not load model at {path}: {str(e)}")
+    return None, None
+
+
+hybrid_model, loaded_model_path = load_hybrid_model()
+if hybrid_model is not None:
+    print(f"SUCCESS: AI Brain loaded from {loaded_model_path}")
+else:
+    print("Warning: Model file not found. Using fallback risk scoring until model is trained.")
 
 
 #  SQLITE DATABASE INITIALIZATION 
@@ -627,7 +647,7 @@ async def predict_fraud(tx: TransactionRequest):
     try:
         with driver.session() as session:
             result = session.run(
-                cypher_query, 
+                cypher_query,
                 sender_id=tx.sender_id,
                 receiver_id=tx.receiver_id,
                 tx_id=tx.transaction_id,
@@ -635,10 +655,11 @@ async def predict_fraud(tx: TransactionRequest):
             )
             record = result.single()
             num_unique_recipients = record["num_unique_recipients"] if record else 0
-            
-            mock_gnn_score = 0.45 
+            mock_gnn_score = 0.45
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Neo4j Database Error: {str(e)}")
+        print(f"Warning: Neo4j unavailable, using fallback graph features. Error: {str(e)}")
+        num_unique_recipients = 0
+        mock_gnn_score = 0.45
 
     # 2. Build the exact feature row our XGBoost model expects
     features = pd.DataFrame([{
@@ -661,13 +682,17 @@ async def predict_fraud(tx: TransactionRequest):
     }])
 
     # 3. Model Inference
-    try:
-        # Wrap it in float() to convert from numpy to native Python float
-        risk_score = float(hybrid_model.predict_proba(features)[0][1])
-        print(f"✅ XGBoost Calculation Success! Real Risk Score: {risk_score}")
-    except Exception as e:
-         print(f"❌ XGBoost Feature Mismatch Error: {str(e)}") 
-         risk_score = 0.65 
+    if hybrid_model is None:
+        risk_score = 0.65
+        print("Warning: Hybrid model unavailable. Using fallback risk score.")
+    else:
+        try:
+            # Wrap it in float() to convert from numpy to native Python float
+            risk_score = float(hybrid_model.predict_proba(features)[0][1])
+            print(f"XGBoost calculation success. Real risk score: {risk_score}")
+        except Exception as e:
+            print(f"Warning: XGBoost inference issue, using fallback risk score. Error: {str(e)}")
+            risk_score = 0.65
 
     # 4. Tier 2 AI Analyst Decision
     decision, reason = apply_ai_analyst(tx.amount, tx.transactions_last_24hr, risk_score)

@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useEffect } from 'react';
+import API_BASE from '../lib/api';
 
 const AlertsContext = createContext();
 
@@ -9,7 +10,7 @@ export function AlertsProvider({ children }) {
 
   useEffect(() => {
     console.log("🔌 SSE hook mounting...");
-    const source = new EventSource('http://127.0.0.1:8000/alerts/stream/analyst_01');
+    const source = new EventSource(`${API_BASE}/alerts/stream/analyst_01`);
 
     source.addEventListener('open', () => console.log("✅ SSE connected"));
 

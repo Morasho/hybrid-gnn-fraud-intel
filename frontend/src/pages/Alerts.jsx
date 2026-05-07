@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAlerts } from '../context/AlertsContext';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 import { ShieldAlert, CheckCircle, XCircle, Clock, Search, ChevronRight } from 'lucide-react';
 
 export default function Alerts() {
@@ -13,7 +14,7 @@ export default function Alerts() {
   useEffect(() => {
     const fetchAlerts = async () => {
       try {
-        const res = await axios.get('http://127.0.0.1:8000/dashboard-stats');
+        const res = await axios.get(`${API_BASE}/dashboard-stats`);
         setAlerts(res.data.alerts);
         if (res.data.alerts.length > 0) {
           setSelectedAlert(res.data.alerts[0]);
@@ -45,7 +46,7 @@ useEffect(() => {
  const handleResolve = async (id, action) => {
     try {
       // Tell the backend to update the SQLite database
-      await axios.post(`http://127.0.0.1:8000/resolve-alert/${id}?action=${action}`);
+      await axios.post(`${API_BASE}/resolve-alert/${id}?action=${action}`);
       
       // Now remove it from the UI list
       const updatedAlerts = alerts.filter(a => a.id !== id);

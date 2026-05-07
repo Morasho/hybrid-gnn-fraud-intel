@@ -3,12 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from neo4j import GraphDatabase
-import asyncio
-import pandas as pd
+from dotenv import load_dotenv
+import asyncio, json
 
+# Load .env from project root (two levels up from this file)
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
+import pandas as pd
 import numpy as np
 import xgboost as xgb
-
 import pickle
 import os
 import torch
@@ -17,14 +19,12 @@ import sqlite3
 import io
 import re
 import sys
-import json  
+from datetime import datetime
 import subprocess
+import json
 import tempfile
 import importlib
 from pathlib import Path
-
-from datetime import datetime
-
 from typing import Any, Literal, Optional
 from threading import Lock
 from sklearn.preprocessing import OrdinalEncoder
@@ -99,9 +99,9 @@ async def send_alert(payload: AlertPayload):  # ✅ Now AlertPayload is already 
 
     return {"status": "sent", "alert": alert}
 
-# Neo4j Connection (Update with your local credentials)
-URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "12345678")
+# Neo4j Connection — credentials loaded from .env
+URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+AUTH = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", ""))
 driver = GraphDatabase.driver(URI, auth=AUTH)
 PREDICT_GRAPH_CONTEXT_DEFAULTS = {
     "num_unique_recipients": 1,
@@ -114,32 +114,6 @@ PREDICT_GRAPH_CONTEXT_DEFAULTS = {
 
 # Load the trained Tier 1 inference artifacts
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-<<<<<<< HEAD
-MODEL_CANDIDATES = [
-    os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl"),
-    os.path.join(BASE_DIR, "ml_pipeline", "models", "saved", "hybrid_xgboost.pkl"),
-]
-
-
-def load_hybrid_model() -> tuple[Any | None, str | None]:
-    """Loads the trained model from known locations, if present."""
-    for path in MODEL_CANDIDATES:
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as f:
-                return pickle.load(f), path
-        except Exception as e:
-            print(f"Warning: Could not load model at {path}: {str(e)}")
-    return None, None
-
-
-hybrid_model, loaded_model_path = load_hybrid_model()
-if hybrid_model is not None:
-    print(f"SUCCESS: AI Brain loaded from {loaded_model_path}")
-else:
-    print("Warning: Model file not found. Using fallback risk scoring until model is trained.")
-=======
 MODEL_ARTIFACT_PATHS = {
     "stacked_hybrid": os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl"),
     "xgboost": os.path.join(BASE_DIR, "models", "saved", "baseline_xgboost.pkl"),
@@ -226,7 +200,6 @@ def fetch_predict_graph_context(sender_id: str, receiver_id: str, tx_id: str, am
         "pagerank_score": float(min((out_degree + in_degree) / 20.0, 1.0)),
         "cycle_indicator": int(record.get("cycle_indicator") or 0),
     }
->>>>>>> 5ad418e8836a8daec77f05312c268e62fb433eed
 
 
 #  SQLITE DATABASE INITIALIZATION 
@@ -260,6 +233,14 @@ def init_db():
             hour INTEGER,
             is_fraud INTEGER,
             fraud_scenario TEXT
+        )
+    """)
+    # Layer 0 Pre-Auth Blocklist — caught fraudsters blocked before any AI compute
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS blocklist (
+            entity_id TEXT PRIMARY KEY,
+            added_on  DATETIME,
+            reason    TEXT
         )
     """)
     conn.commit()
@@ -1478,30 +1459,40 @@ def _infer_live_sample_rows(model: str, df: pd.DataFrame) -> dict[str, Any]:
 async def predict_fraud(tx: TransactionRequest):
     """
     The Core Engine: 
+    0. Layer 0 Blocklist pre-check (skip all AI compute if entity is known fraudster).
     1. Receives tabular data. 
     2. Queries Neo4j for network context and updates the graph. 
     3. Runs Hybrid Model. 
     4. Applies AI Analyst rules.
     """
+    # 0. Layer 0 — Pre-Auth Blocklist check (fastest gate, runs before everything)
+    conn_bl = sqlite3.connect("fraud_intel.db")
+    cursor_bl = conn_bl.cursor()
+    cursor_bl.execute(
+        "SELECT reason FROM blocklist WHERE entity_id = ? OR entity_id = ? LIMIT 1",
+        (tx.sender_id, tx.receiver_id),
+    )
+    blocked = cursor_bl.fetchone()
+    conn_bl.close()
+    if blocked:
+        block_reason = f"Entity on National Fraud Blocklist: {blocked[0]}"
+        # Still persist the blocked attempt for audit trail
+        conn_audit = sqlite3.connect("fraud_intel.db")
+        conn_audit.execute(
+            "INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tx.transaction_id, datetime.now(), tx.sender_id, tx.receiver_id, tx.amount, 100.0, "TRANSACTION_BLOCKED", block_reason),
+        )
+        conn_audit.commit()
+        conn_audit.close()
+        return PredictionResponse(
+            transaction_id=tx.transaction_id,
+            risk_score=1.0,
+            decision="TRANSACTION_BLOCKED",
+            reason=block_reason,
+        )
+
     graph_context = PREDICT_GRAPH_CONTEXT_DEFAULTS.copy()
     try:
-<<<<<<< HEAD
-        with driver.session() as session:
-            result = session.run(
-                cypher_query,
-                sender_id=tx.sender_id,
-                receiver_id=tx.receiver_id,
-                tx_id=tx.transaction_id,
-                amount=tx.amount
-            )
-            record = result.single()
-            num_unique_recipients = record["num_unique_recipients"] if record else 0
-            mock_gnn_score = 0.45
-    except Exception as e:
-        print(f"Warning: Neo4j unavailable, using fallback graph features. Error: {str(e)}")
-        num_unique_recipients = 0
-        mock_gnn_score = 0.45
-=======
         graph_context.update(
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1516,7 +1507,6 @@ async def predict_fraud(tx: TransactionRequest):
         )
     except Exception as e:
         print(f"WARNING: Neo4j graph context unavailable for /predict, using fallback values. Details: {str(e)}")
->>>>>>> 5ad418e8836a8daec77f05312c268e62fb433eed
 
     # 2. Build the exact feature row our hybrid model expects
     row = pd.DataFrame([{
@@ -1544,19 +1534,6 @@ async def predict_fraud(tx: TransactionRequest):
     features = prepare_hybrid_feature_frame(row)
 
     # 3. Model Inference
-<<<<<<< HEAD
-    if hybrid_model is None:
-        risk_score = 0.65
-        print("Warning: Hybrid model unavailable. Using fallback risk score.")
-    else:
-        try:
-            # Wrap it in float() to convert from numpy to native Python float
-            risk_score = float(hybrid_model.predict_proba(features)[0][1])
-            print(f"XGBoost calculation success. Real risk score: {risk_score}")
-        except Exception as e:
-            print(f"Warning: XGBoost inference issue, using fallback risk score. Error: {str(e)}")
-            risk_score = 0.65
-=======
     try:
         # Check if model is loaded
         if hybrid_model is None:
@@ -1567,7 +1544,6 @@ async def predict_fraud(tx: TransactionRequest):
     except Exception as e:
          print(f"ERROR: Hybrid prediction failed. Details: {str(e)}") 
          risk_score = 0.65 
->>>>>>> 5ad418e8836a8daec77f05312c268e62fb433eed
 
     # 4. Tier 2 AI Analyst Decision
     decision, reason = apply_ai_analyst(tx.amount, tx.transactions_last_24hr, risk_score)
@@ -1663,18 +1639,263 @@ async def get_dashboard_stats():
         "alerts": recent_alerts
     }
     
+# AI ANALYST SUMMARY ENDPOINT
+@app.get("/ai-analyst-summary")
+async def get_ai_analyst_summary():
+    """
+    Returns a full breakdown of how the AI Analyst (Tier 2) resolved cases:
+    - Decision counts from SQLite (live transactions)
+    - Per-topology breakdown from review_queue.csv (batch run output)
+    - The 4 Kenyan business rule definitions
+    """
+    # --- SQLite live decision counts ---
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    decision_labels = [
+        "AUTO_FREEZE", "CONFIRMED_FRAUD", "REQUIRE_HUMAN",
+        "AUTO_CLEARED_SAFE", "RESOLVED_SAFE", "RESOLVED_FRAUD",
+    ]
+    decision_counts: dict[str, int] = {}
+    for label in decision_labels:
+        cursor.execute("SELECT COUNT(*) FROM transactions WHERE decision = ?", (label,))
+        decision_counts[label] = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM transactions")
+    total_live = cursor.fetchone()[0]
+
+    # Recent REQUIRE_HUMAN cases for the queue table
+    cursor.execute("""
+        SELECT transaction_id, sender_id, receiver_id, amount, risk_score, decision, reason, timestamp
+        FROM transactions
+        WHERE decision = 'REQUIRE_HUMAN'
+        ORDER BY timestamp DESC LIMIT 10
+    """)
+    pending_rows = cursor.fetchall()
+    pending_cases = [
+        {
+            "id": r["transaction_id"],
+            "sender": r["sender_id"],
+            "receiver": r["receiver_id"],
+            "amount": r["amount"],
+            "risk_score": r["risk_score"],
+            "decision": r["decision"],
+            "reason": r["reason"],
+            "timestamp": r["timestamp"],
+        }
+        for r in pending_rows
+    ]
+    conn.close()
+
+    # --- Batch review_queue.csv breakdown (run off the event loop) ---
+    topology_breakdown = []
+    review_queue_path = os.path.join(BASE_DIR, "data", "processed", "review_queue.csv")
+
+    def _compute_topology_breakdown(path: str):
+        import numpy as np
+        rq_df = pd.read_csv(path, usecols=["amount", "transactions_last_24hr", "Probability", "Actual", "fraud_scenario"])
+        prob     = rq_df["Probability"].fillna(0.5)
+        amount   = rq_df["amount"].fillna(500)
+        velocity = rq_df["transactions_last_24hr"].fillna(1)
+
+        # Vectorised elif chain — matches apply() logic exactly, ~100× faster
+        ai_decision = np.select(
+            [
+                (prob > 0.50) & (amount < 300)   & (velocity > 5),
+                (prob < 0.50) & (amount >= 100)  & (amount <= 3000) & (velocity < 4),
+                amount > 100000,
+                (prob > 0.60) & (amount >= 5000) & (amount <= 15000) & (velocity > 2),
+            ],
+            ["CONFIRMED_FRAUD", "AUTO_CLEARED_SAFE", "REQUIRE_HUMAN", "CONFIRMED_FRAUD"],
+            default="REQUIRE_HUMAN",
+        )
+        rq_df["AI_Decision"] = ai_decision
+        result = []
+        for topo in rq_df["fraud_scenario"].unique():
+            td = rq_df[rq_df["fraud_scenario"] == topo]
+            result.append({
+                "topology": str(topo),
+                "total_in_queue": int(len(td)),
+                "actual_fraud": int((td["Actual"] == 1).sum()),
+                "false_alarms_cleared": int(((td["AI_Decision"] == "AUTO_CLEARED_SAFE") & (td["Actual"] == 0)).sum()),
+                "fraud_caught": int(((td["AI_Decision"] == "CONFIRMED_FRAUD") & (td["Actual"] == 1)).sum()),
+                "sent_to_human": int((td["AI_Decision"] == "REQUIRE_HUMAN").sum()),
+            })
+        return result
+
+    if os.path.exists(review_queue_path):
+        try:
+            topology_breakdown = await asyncio.to_thread(_compute_topology_breakdown, review_queue_path)
+        except Exception as e:
+            print(f"WARNING: Could not parse review_queue.csv: {e}")
+
+    # --- Static rule definitions ---
+    rules = [
+        {
+            "id": 1,
+            "name": "Kamiti / M-Pesa Reversal Scam",
+            "condition": "Risk > 50%  AND  amount < 300  AND  velocity > 5",
+            "decision": "CONFIRMED_FRAUD",
+            "description": "Micro-transactions fired at high velocity — classic mass scam testing numbers. Auto-confirmed as fraud.",
+            "color": "red",
+        },
+        {
+            "id": 2,
+            "name": "Mama Mboga / Kiosk Normalcy Check",
+            "condition": "Risk < 50%  AND  100 ≤ amount ≤ 3,000  AND  velocity < 4",
+            "decision": "AUTO_CLEARED_SAFE",
+            "description": "Standard retail grocery payment with low velocity. AI clears the false alarm immediately.",
+            "color": "green",
+        },
+        {
+            "id": 3,
+            "name": "Wash-Wash / Real Estate Ring",
+            "condition": "amount > 100,000",
+            "decision": "REQUIRE_HUMAN",
+            "description": "High-value transfers exceed compliance threshold. AI is not authorised to clear — escalated to human analyst.",
+            "color": "yellow",
+        },
+        {
+            "id": 4,
+            "name": "Fuliza / Loan Siphon",
+            "condition": "Risk > 60%  AND  5,000 ≤ amount ≤ 15,000  AND  velocity > 2",
+            "decision": "CONFIRMED_FRAUD",
+            "description": "Amount perfectly matches a Fuliza credit-limit drain at suspicious velocity. Confirmed fraud.",
+            "color": "red",
+        },
+        {
+            "id": 5,
+            "name": "Auto-Freeze (Severe Topology)",
+            "condition": "Risk ≥ 85%",
+            "decision": "AUTO_FREEZE",
+            "description": "Extremely high model confidence — transaction frozen instantly before analyst review.",
+            "color": "purple",
+        },
+    ]
+
+    batch_totals = {
+        "fraud_caught": sum(r["fraud_caught"] for r in topology_breakdown),
+        "false_alarms_cleared": sum(r["false_alarms_cleared"] for r in topology_breakdown),
+        "sent_to_human": sum(r["sent_to_human"] for r in topology_breakdown),
+        "total_in_queue": sum(r["total_in_queue"] for r in topology_breakdown),
+    }
+
+    return {
+        "total_live_transactions": total_live,
+        "decision_counts": decision_counts,
+        "batch_totals": batch_totals,
+        "pending_cases": pending_cases,
+        "topology_breakdown": topology_breakdown,
+        "rules": rules,
+    }
+
+
 # RESOLVE ALERT ENDPOINT
 @app.post("/resolve-alert/{tx_id}")
 async def resolve_alert(tx_id: str, action: str = Query(...)):
-    """Updates the transaction status in SQLite based on analyst decision."""
+    """Updates the transaction status in SQLite. On reject, adds the sender to the blocklist."""
     new_decision = "RESOLVED_SAFE" if action == "approve" else "RESOLVED_FRAUD"
-    
+
     conn = sqlite3.connect("fraud_intel.db")
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("UPDATE transactions SET decision = ? WHERE transaction_id = ?", (new_decision, tx_id))
+
+    # Analyst Feedback Loop — confirmed fraud means the sender goes on the blocklist
+    if action == "reject":
+        cursor.execute("SELECT sender_id FROM transactions WHERE transaction_id = ? LIMIT 1", (tx_id,))
+        row = cursor.fetchone()
+        if row and row["sender_id"]:
+            try:
+                cursor.execute(
+                    "INSERT INTO blocklist (entity_id, added_on, reason) VALUES (?, ?, ?)",
+                    (row["sender_id"], datetime.now(), f"Confirmed fraud on transaction {tx_id}"),
+                )
+                print(f"BLOCKLIST: Added {row['sender_id']} for transaction {tx_id}")
+            except sqlite3.IntegrityError:
+                print(f"BLOCKLIST: {row['sender_id']} already on blocklist — skipping")
+
     conn.commit()
     conn.close()
     return {"status": "updated", "new_decision": new_decision}
+
+
+# ── SAFARICOM DARAJA WEBHOOK BRIDGE ──────────────────────────────────────────
+
+class DarajaCallback(BaseModel):
+    """Standard Safaricom Daraja C2B / B2C callback payload."""
+    TransID: str
+    TransAmount: float
+    MSISDN: str                        # sender phone number
+    BillRefNumber: str                 # receiver identifier
+    TransTime: Optional[str] = None
+    BusinessShortCode: Optional[str] = None
+    FirstName: Optional[str] = None
+
+
+def _normalise_msisdn(msisdn: str) -> str:
+    """Normalise any Kenyan number format to 2547XXXXXXXX."""
+    msisdn = msisdn.strip().replace(" ", "").replace("-", "")
+    if msisdn.startswith("+"):
+        msisdn = msisdn[1:]
+    if msisdn.startswith("07") or msisdn.startswith("01"):
+        msisdn = "254" + msisdn[1:]
+    if msisdn.startswith("7") or msisdn.startswith("1"):
+        msisdn = "254" + msisdn
+    return msisdn
+
+
+@app.post("/daraja-webhook")
+async def daraja_webhook(payload: DarajaCallback):
+    """
+    Safaricom Daraja C2B Webhook Bridge.
+    Standardises the M-Pesa payload, runs it through the AI fraud engine,
+    and returns a Daraja-compliant ResultCode (0 = accept, 1 = reject/block).
+    """
+    # Validate BusinessShortCode matches our configured shortcode (if env var is set)
+    configured_shortcode = os.getenv("DARAJA_SHORTCODE", "")
+    if configured_shortcode and payload.BusinessShortCode:
+        if str(payload.BusinessShortCode) != str(configured_shortcode):
+            raise HTTPException(
+                status_code=403,
+                detail=f"BusinessShortCode mismatch: expected {configured_shortcode}",
+            )
+
+    sender_msisdn = _normalise_msisdn(payload.MSISDN)
+
+    # Map Daraja fields → internal TransactionRequest
+    internal_tx = TransactionRequest(
+        transaction_id=payload.TransID,
+        sender_id=sender_msisdn,
+        receiver_id=str(payload.BillRefNumber),
+        amount=payload.TransAmount,
+        transactions_last_24hr=1,   # Daraja doesn't supply velocity; use safe default
+        hour=datetime.now().hour,
+    )
+
+    # Run through the full AI engine (blocklist → GNN → XGBoost → Analyst rules)
+    response = await predict_fraud(internal_tx)
+
+    # Map AI decision to Daraja ResultCode
+    blocked_decisions = {"TRANSACTION_BLOCKED", "AUTO_FREEZE", "CONFIRMED_FRAUD"}
+    if response.decision in blocked_decisions:
+        result_code = 1
+        result_desc = f"Transaction Declined: {response.reason}"
+    else:
+        result_code = 0
+        result_desc = "Transaction Accepted"
+
+    return {
+        "ResultCode": result_code,
+        "ResultDesc": result_desc,
+        "TransID": payload.TransID,
+        "AIDecision": response.decision,
+        "RiskScore": round(response.risk_score * 100, 1),
+        "Reason": response.reason,
+    }
+
+
 @app.get("/dataset-status")
 async def get_dataset_status():
     """Return the dataset currently driving the Models page."""

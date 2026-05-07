@@ -8,6 +8,9 @@ import FraudNetwork from './pages/FraudNetwork';
 import Alerts from './pages/Alerts';
 import Models from './pages/Models';
 import AIBot from './pages/AIBot';
+import AIAnalyst from './pages/AIAnalyst';
+import USSDSimulator from './pages/USSDSimulator';
+import StandaloneMobile from './pages/StandaloneMobile';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 
@@ -18,18 +21,28 @@ function App() {
     <AlertsProvider>
       <SampleDataProvider>
         <Router>
-          <Layout>
-            <Routes>
-              <Route path="/" element={<Home />} /> {/*  Updated route */}
-              <Route path="/transactions" element={<Transactions />} />
-              <Route path="/network" element={<FraudNetwork />} />
-              <Route path="/alerts" element={<Alerts />} />
-              <Route path="/models" element={<Models />} />
-              <Route path="/ai-bot" element={<AIBot />} />
-              <Route path="/reports" element={<Reports />} />
-              <Route path="/settings" element={<Settings />} />
-            </Routes>
-          </Layout>
+          <Routes>
+            {/* ── Chromeless route — no sidebar, no layout ── */}
+            <Route path="/mobile" element={<StandaloneMobile />} />
+
+            {/* ── Analyst dashboard — wrapped in Layout ── */}
+            <Route path="/*" element={
+              <Layout>
+                <Routes>
+                  <Route path="/" element={<Home />} />
+                  <Route path="/transactions" element={<Transactions />} />
+                  <Route path="/network" element={<FraudNetwork />} />
+                  <Route path="/alerts" element={<Alerts />} />
+                  <Route path="/models" element={<Models />} />
+                  <Route path="/ai-bot" element={<AIBot />} />
+                  <Route path="/ai-analyst" element={<AIAnalyst />} />
+                  <Route path="/ussd-sim" element={<USSDSimulator />} />
+                  <Route path="/reports" element={<Reports />} />
+                  <Route path="/settings" element={<Settings />} />
+                </Routes>
+              </Layout>
+            } />
+          </Routes>
         </Router>
       </SampleDataProvider>
     </AlertsProvider>

@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
+from pathlib import Path
 import asyncio, json
 
 # Load .env from project root (two levels up from this file)
@@ -217,9 +218,15 @@ def init_db():
             amount REAL,
             risk_score REAL,
             decision TEXT,
-            reason TEXT
+            reason TEXT,
+            device_id TEXT
         )
     """)
+    # Migrate: add device_id column to existing tables that pre-date this schema
+    try:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN device_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS uploaded_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1832,6 +1839,7 @@ class DarajaCallback(BaseModel):
     TransTime: Optional[str] = None
     BusinessShortCode: Optional[str] = None
     FirstName: Optional[str] = None
+    device_id: Optional[str] = None   # simulator device fingerprint (Case Study 4)
 
 
 def _normalise_msisdn(msisdn: str) -> str:
@@ -1863,6 +1871,23 @@ async def daraja_webhook(payload: DarajaCallback):
             )
 
     sender_msisdn = _normalise_msisdn(payload.MSISDN)
+    device_id = (payload.device_id or "").strip() or None
+
+    # ── Shared Device Detection (Case Study 4 — Synthetic Loan Farm) ──────────
+    # If this device_id was previously used by a *different* sender, it signals
+    # a SIM-swap fraud pattern: same physical phone, new SIM card.
+    shared_device_blocked = False
+    if device_id:
+        conn_dev = sqlite3.connect("fraud_intel.db")
+        cursor_dev = conn_dev.cursor()
+        cursor_dev.execute(
+            "SELECT COUNT(*) FROM transactions WHERE device_id = ? AND sender_id != ? LIMIT 1",
+            (device_id, sender_msisdn),
+        )
+        shared_device_count = cursor_dev.fetchone()[0]
+        conn_dev.close()
+        if shared_device_count > 0:
+            shared_device_blocked = True
 
     # Map Daraja fields → internal TransactionRequest
     internal_tx = TransactionRequest(
@@ -1876,6 +1901,25 @@ async def daraja_webhook(payload: DarajaCallback):
 
     # Run through the full AI engine (blocklist → GNN → XGBoost → Analyst rules)
     response = await predict_fraud(internal_tx)
+
+    # Override: shared device fingerprint always triggers AUTO_FREEZE
+    if shared_device_blocked and response.decision not in {"TRANSACTION_BLOCKED"}:
+        response = PredictionResponse(
+            transaction_id=internal_tx.transaction_id,
+            risk_score=0.96,
+            decision="AUTO_FREEZE",
+            reason="Shared device fingerprint detected: SIM Swap fraud pattern (Synthetic Loan Farm).",
+        )
+
+    # Persist device_id on the transaction record for future shared-device lookups
+    if device_id:
+        conn_upd = sqlite3.connect("fraud_intel.db")
+        conn_upd.execute(
+            "UPDATE transactions SET device_id = ? WHERE transaction_id = ?",
+            (device_id, internal_tx.transaction_id),
+        )
+        conn_upd.commit()
+        conn_upd.close()
 
     # Map AI decision to Daraja ResultCode
     blocked_decisions = {"TRANSACTION_BLOCKED", "AUTO_FREEZE", "CONFIRMED_FRAUD"}

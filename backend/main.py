@@ -231,6 +231,14 @@ def init_db():
             fraud_scenario TEXT
         )
     """)
+    # Layer 0 Pre-Auth Blocklist — caught fraudsters blocked before any AI compute
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS blocklist (
+            entity_id TEXT PRIMARY KEY,
+            added_on  DATETIME,
+            reason    TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -1447,11 +1455,38 @@ def _infer_live_sample_rows(model: str, df: pd.DataFrame) -> dict[str, Any]:
 async def predict_fraud(tx: TransactionRequest):
     """
     The Core Engine: 
+    0. Layer 0 Blocklist pre-check (skip all AI compute if entity is known fraudster).
     1. Receives tabular data. 
     2. Queries Neo4j for network context and updates the graph. 
     3. Runs Hybrid Model. 
     4. Applies AI Analyst rules.
     """
+    # 0. Layer 0 — Pre-Auth Blocklist check (fastest gate, runs before everything)
+    conn_bl = sqlite3.connect("fraud_intel.db")
+    cursor_bl = conn_bl.cursor()
+    cursor_bl.execute(
+        "SELECT reason FROM blocklist WHERE entity_id = ? OR entity_id = ? LIMIT 1",
+        (tx.sender_id, tx.receiver_id),
+    )
+    blocked = cursor_bl.fetchone()
+    conn_bl.close()
+    if blocked:
+        block_reason = f"Entity on National Fraud Blocklist: {blocked[0]}"
+        # Still persist the blocked attempt for audit trail
+        conn_audit = sqlite3.connect("fraud_intel.db")
+        conn_audit.execute(
+            "INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tx.transaction_id, datetime.now(), tx.sender_id, tx.receiver_id, tx.amount, 100.0, "TRANSACTION_BLOCKED", block_reason),
+        )
+        conn_audit.commit()
+        conn_audit.close()
+        return PredictionResponse(
+            transaction_id=tx.transaction_id,
+            risk_score=1.0,
+            decision="TRANSACTION_BLOCKED",
+            reason=block_reason,
+        )
+
     graph_context = PREDICT_GRAPH_CONTEXT_DEFAULTS.copy()
     try:
         graph_context.update(
@@ -1755,15 +1790,99 @@ async def get_ai_analyst_summary():
 # RESOLVE ALERT ENDPOINT
 @app.post("/resolve-alert/{tx_id}")
 async def resolve_alert(tx_id: str, action: str = Query(...)):
-    """Updates the transaction status in SQLite based on analyst decision."""
+    """Updates the transaction status in SQLite. On reject, adds the sender to the blocklist."""
     new_decision = "RESOLVED_SAFE" if action == "approve" else "RESOLVED_FRAUD"
-    
+
     conn = sqlite3.connect("fraud_intel.db")
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("UPDATE transactions SET decision = ? WHERE transaction_id = ?", (new_decision, tx_id))
+
+    # Analyst Feedback Loop — confirmed fraud means the sender goes on the blocklist
+    if action == "reject":
+        cursor.execute("SELECT sender_id FROM transactions WHERE transaction_id = ? LIMIT 1", (tx_id,))
+        row = cursor.fetchone()
+        if row and row["sender_id"]:
+            try:
+                cursor.execute(
+                    "INSERT INTO blocklist (entity_id, added_on, reason) VALUES (?, ?, ?)",
+                    (row["sender_id"], datetime.now(), f"Confirmed fraud on transaction {tx_id}"),
+                )
+                print(f"BLOCKLIST: Added {row['sender_id']} for transaction {tx_id}")
+            except sqlite3.IntegrityError:
+                print(f"BLOCKLIST: {row['sender_id']} already on blocklist — skipping")
+
     conn.commit()
     conn.close()
     return {"status": "updated", "new_decision": new_decision}
+
+
+# ── SAFARICOM DARAJA WEBHOOK BRIDGE ──────────────────────────────────────────
+
+class DarajaCallback(BaseModel):
+    """Standard Safaricom Daraja C2B / B2C callback payload."""
+    TransID: str
+    TransAmount: float
+    MSISDN: str                        # sender phone number
+    BillRefNumber: str                 # receiver identifier
+    TransTime: Optional[str] = None
+    BusinessShortCode: Optional[str] = None
+    FirstName: Optional[str] = None
+
+
+def _normalise_msisdn(msisdn: str) -> str:
+    """Normalise any Kenyan number format to 2547XXXXXXXX."""
+    msisdn = msisdn.strip().replace(" ", "").replace("-", "")
+    if msisdn.startswith("+"):
+        msisdn = msisdn[1:]
+    if msisdn.startswith("07") or msisdn.startswith("01"):
+        msisdn = "254" + msisdn[1:]
+    if msisdn.startswith("7") or msisdn.startswith("1"):
+        msisdn = "254" + msisdn
+    return msisdn
+
+
+@app.post("/daraja-webhook")
+async def daraja_webhook(payload: DarajaCallback):
+    """
+    Safaricom Daraja C2B Webhook Bridge.
+    Standardises the M-Pesa payload, runs it through the AI fraud engine,
+    and returns a Daraja-compliant ResultCode (0 = accept, 1 = reject/block).
+    """
+    sender_msisdn = _normalise_msisdn(payload.MSISDN)
+
+    # Map Daraja fields → internal TransactionRequest
+    internal_tx = TransactionRequest(
+        transaction_id=payload.TransID,
+        sender_id=sender_msisdn,
+        receiver_id=str(payload.BillRefNumber),
+        amount=payload.TransAmount,
+        transactions_last_24hr=1,   # Daraja doesn't supply velocity; use safe default
+        hour=datetime.now().hour,
+    )
+
+    # Run through the full AI engine (blocklist → GNN → XGBoost → Analyst rules)
+    response = await predict_fraud(internal_tx)
+
+    # Map AI decision to Daraja ResultCode
+    blocked_decisions = {"TRANSACTION_BLOCKED", "AUTO_FREEZE", "CONFIRMED_FRAUD"}
+    if response.decision in blocked_decisions:
+        result_code = 1
+        result_desc = f"Transaction Declined: {response.reason}"
+    else:
+        result_code = 0
+        result_desc = "Transaction Accepted"
+
+    return {
+        "ResultCode": result_code,
+        "ResultDesc": result_desc,
+        "TransID": payload.TransID,
+        "AIDecision": response.decision,
+        "RiskScore": round(response.risk_score * 100, 1),
+        "Reason": response.reason,
+    }
+
+
 @app.get("/dataset-status")
 async def get_dataset_status():
     """Return the dataset currently driving the Models page."""

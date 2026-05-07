@@ -3,7 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from neo4j import GraphDatabase
+from dotenv import load_dotenv
 import asyncio, json
+
+# Load .env from project root (two levels up from this file)
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -95,9 +99,9 @@ async def send_alert(payload: AlertPayload):  # ✅ Now AlertPayload is already 
 
     return {"status": "sent", "alert": alert}
 
-# Neo4j Connection (Update with your local credentials)
-URI = "neo4j://localhost:7687"
-AUTH = ("neo4j", "12345678")
+# Neo4j Connection — credentials loaded from .env
+URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+AUTH = (os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", ""))
 driver = GraphDatabase.driver(URI, auth=AUTH)
 PREDICT_GRAPH_CONTEXT_DEFAULTS = {
     "num_unique_recipients": 1,
@@ -1849,6 +1853,15 @@ async def daraja_webhook(payload: DarajaCallback):
     Standardises the M-Pesa payload, runs it through the AI fraud engine,
     and returns a Daraja-compliant ResultCode (0 = accept, 1 = reject/block).
     """
+    # Validate BusinessShortCode matches our configured shortcode (if env var is set)
+    configured_shortcode = os.getenv("DARAJA_SHORTCODE", "")
+    if configured_shortcode and payload.BusinessShortCode:
+        if str(payload.BusinessShortCode) != str(configured_shortcode):
+            raise HTTPException(
+                status_code=403,
+                detail=f"BusinessShortCode mismatch: expected {configured_shortcode}",
+            )
+
     sender_msisdn = _normalise_msisdn(payload.MSISDN)
 
     # Map Daraja fields → internal TransactionRequest

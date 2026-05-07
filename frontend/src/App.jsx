@@ -8,6 +8,7 @@ import FraudNetwork from './pages/FraudNetwork';
 import Alerts from './pages/Alerts';
 import Models from './pages/Models';
 import AIBot from './pages/AIBot';
+import AIAnalyst from './pages/AIAnalyst';
 import Reports from './pages/Reports';
 import Settings from './pages/Settings';
 
@@ -26,6 +27,7 @@ function App() {
               <Route path="/alerts" element={<Alerts />} />
               <Route path="/models" element={<Models />} />
               <Route path="/ai-bot" element={<AIBot />} />
+              <Route path="/ai-analyst" element={<AIAnalyst />} />
               <Route path="/reports" element={<Reports />} />
               <Route path="/settings" element={<Settings />} />
             </Routes>

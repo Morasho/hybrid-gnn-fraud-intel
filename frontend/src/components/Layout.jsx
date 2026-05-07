@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 import { Link } from 'react-router-dom';
 import { useAlerts } from '../context/AlertsContext';
-import { Shield, LayoutDashboard, Receipt, Network, Bell, BarChart3, FileText, Settings, User, ShieldAlert } from 'lucide-react';
+import { Shield, LayoutDashboard, Receipt, Network, Bell, BarChart3, FileText, Settings, User, ShieldAlert, BrainCircuit } from 'lucide-react';
 
 export default function Layout({ children }) {
   const location = useLocation();
@@ -23,6 +23,7 @@ export default function Layout({ children }) {
     { name: 'Alerts', path: '/alerts', icon: Bell },
     { name: 'Models', path: '/models', icon: BarChart3 },
     { name: 'AI Bot', path: '/ai-bot', icon: User },
+    { name: 'AI Analyst', path: '/ai-analyst', icon: BrainCircuit },
     { name: 'Reports', path: '/reports', icon: FileText },
     { name: 'Settings', path: '/settings', icon: Settings },
   ];

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 import { MessageCircle, BarChart3, Zap, HelpCircle, BookOpen } from 'lucide-react';
 
 const AI_EXPLAIN_CACHE_KEY = 'aiBot:modelExplanations';
@@ -42,7 +43,7 @@ export default function AIBot() {
       setLoading(true);
     }
 
-    axios.get(`http://127.0.0.1:8000/ai-explain-model/${selectedModel}`)
+    axios.get(`${API_BASE}/ai-explain-model/${selectedModel}`)
       .then(res => {
         if (requestId !== requestIdRef.current) return;
         setExplanation(res.data);
@@ -66,7 +67,7 @@ export default function AIBot() {
     modelOptions
       .filter((model) => !cached[model])
       .forEach((model) => {
-        axios.get(`http://127.0.0.1:8000/ai-explain-model/${model}`)
+        axios.get(`${API_BASE}/ai-explain-model/${model}`)
           .then((res) => {
             const nextCache = {
               ...readCache(),
@@ -85,7 +86,7 @@ export default function AIBot() {
     if (!txId) return;
     setTxLoading(true);
     try {
-      const res = await axios.post('http://127.0.0.1:8000/ai/analyst/explain', {
+      const res = await axios.post(`${API_BASE}/ai/analyst/explain`, {
         transaction_id: txId,
         model: selectedModel,
       });

@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState } from 'react';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 
 const SampleDataContext = createContext();
 
@@ -10,7 +11,7 @@ export function SampleDataProvider({ children }) {
   const refreshSampleStatus = async () => {
     setCheckingStatus(true);
     try {
-      const response = await axios.get('http://127.0.0.1:8000/api/samples/status');
+      const response = await axios.get(`${API_BASE}/api/samples/status`);
       if (response.data?.loaded && response.data?.sample_meta) {
         setLoadedSample(response.data.sample_meta);
       } else {
@@ -26,7 +27,7 @@ export function SampleDataProvider({ children }) {
 
   const clearLoadedSample = async () => {
     try {
-      await axios.post('http://127.0.0.1:8000/api/samples/clear');
+      await axios.post(`${API_BASE}/api/samples/clear`);
     } catch (err) {
       console.error('Could not clear sample cache:', err);
     } finally {

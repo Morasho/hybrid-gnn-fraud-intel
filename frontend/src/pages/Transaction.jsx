@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 import { ShieldAlert, ShieldCheck, Activity, Search, Upload, BarChart3, Zap, AlertCircle, CheckCircle, X } from 'lucide-react';
 import { useSampleData } from '../context/SampleDataContext';
 
@@ -90,7 +91,7 @@ export default function Transactions() {
     } else if (err.request && !err.response) {
       // Request was made but no response received
       message = 'Cannot connect to backend server';
-      details = 'Is FastAPI running on http://127.0.0.1:8000?';
+      details = `Is FastAPI running on ${API_BASE}?`;
       setApiHealthy(false);
     } else if (err.message) {
       message = err.message;
@@ -164,7 +165,7 @@ export default function Transactions() {
       setError(null);
       setErrorDetails(null);
 
-      const response = await axios.post('http://127.0.0.1:8000/api/samples/load', formDataUpload, {
+      const response = await axios.post(`${API_BASE}/api/samples/load`, formDataUpload, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 120000
       });
@@ -220,7 +221,7 @@ export default function Transactions() {
       };
 
       // Get stacked hybrid prediction
-      const hybridResponse = await axios.post('http://127.0.0.1:8000/predict', payload, {
+      const hybridResponse = await axios.post(`${API_BASE}/predict`, payload, {
         timeout: 30000
       });
       
@@ -233,7 +234,7 @@ export default function Transactions() {
 
       // Get model comparison
       try {
-        const comparisonResponse = await axios.post('http://127.0.0.1:8000/run-transaction-comparison', payload, {
+        const comparisonResponse = await axios.post(`${API_BASE}/run-transaction-comparison`, payload, {
           timeout: 30000
         });
         if (comparisonResponse.data) {
@@ -279,7 +280,7 @@ export default function Transactions() {
         receiver_id: selectedUploadedTx.receiver_id || 'UNKNOWN'
       };
 
-      const comparisonResponse = await axios.post('http://127.0.0.1:8000/run-transaction-comparison', txData, {
+      const comparisonResponse = await axios.post(`${API_BASE}/run-transaction-comparison`, txData, {
         timeout: 30000
       });
       

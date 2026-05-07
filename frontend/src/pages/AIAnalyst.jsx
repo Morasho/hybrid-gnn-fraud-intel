@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 import {
   Brain,
   ShieldCheck,
@@ -88,7 +89,7 @@ export default function AIAnalyst() {
     else setLoading(true);
     setError(null);
     try {
-      const res = await axios.get('http://127.0.0.1:8000/ai-analyst-summary');
+      const res = await axios.get(`${API_BASE}/ai-analyst-summary`);
       setData(res.data);
     } catch (err) {
       setError('Could not connect to the backend. Make sure uvicorn is running.');

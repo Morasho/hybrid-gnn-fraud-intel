@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 import { Activity, AlertTriangle, TrendingUp, Clock, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 
@@ -14,7 +15,7 @@ export default function Home() {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const res = await axios.get('http://127.0.0.1:8000/dashboard-stats');
+        const res = await axios.get(`${API_BASE}/dashboard-stats`);
         setStats(res.data);
       } catch (err) {
         console.error("Failed to fetch SQLite stats:", err);

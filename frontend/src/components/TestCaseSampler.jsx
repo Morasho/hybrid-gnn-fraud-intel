@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Beaker, BarChart3, Database } from 'lucide-react';
 import axios from 'axios';
+import API_BASE from '../lib/api';
 import { useSampleData } from '../context/SampleDataContext';
 
 export default function TestCaseSampler({ onCaseSelect }) {
@@ -14,7 +15,7 @@ export default function TestCaseSampler({ onCaseSelect }) {
 
   // Fetch test cases
   useEffect(() => {
-    axios.get('http://127.0.0.1:8000/fraud-test-cases')
+    axios.get(`${API_BASE}/fraud-test-cases`)
       .then(res => {
         setCases(res.data.cases);
         if (res.data.cases.length > 0) {
@@ -36,10 +37,10 @@ export default function TestCaseSampler({ onCaseSelect }) {
 
     try {
       const response = loadedSample
-        ? await axios.post('http://127.0.0.1:8000/api/inference/live-sample', {
+        ? await axios.post(`${API_BASE}/api/inference/live-sample`, {
             model,
           })
-        : await axios.post('http://127.0.0.1:8000/api/models/run-live-test', {
+        : await axios.post(`${API_BASE}/api/models/run-live-test`, {
             model,
             case_id: currentCase.id,
             sample: currentCase.data,

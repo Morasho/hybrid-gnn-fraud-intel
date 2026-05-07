@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react';
 import { BarChart3, TrendingUp, AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
 import axios from 'axios';
-
-const API_BASE = 'http://127.0.0.1:8000';
+import API_BASE from '../lib/api';
 const MODEL_CACHE_KEY = 'modelComparison:cache';
 const MODEL_RUN_OUTPUT_KEY = 'modelComparison:runOutputs';
 const SELECTED_MODEL_KEY = 'modelComparison:selectedModel';

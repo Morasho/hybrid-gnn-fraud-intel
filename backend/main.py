@@ -1600,6 +1600,158 @@ async def get_dashboard_stats():
         "alerts": recent_alerts
     }
     
+# AI ANALYST SUMMARY ENDPOINT
+@app.get("/ai-analyst-summary")
+async def get_ai_analyst_summary():
+    """
+    Returns a full breakdown of how the AI Analyst (Tier 2) resolved cases:
+    - Decision counts from SQLite (live transactions)
+    - Per-topology breakdown from review_queue.csv (batch run output)
+    - The 4 Kenyan business rule definitions
+    """
+    # --- SQLite live decision counts ---
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    decision_labels = [
+        "AUTO_FREEZE", "CONFIRMED_FRAUD", "REQUIRE_HUMAN",
+        "AUTO_CLEARED_SAFE", "RESOLVED_SAFE", "RESOLVED_FRAUD",
+    ]
+    decision_counts: dict[str, int] = {}
+    for label in decision_labels:
+        cursor.execute("SELECT COUNT(*) FROM transactions WHERE decision = ?", (label,))
+        decision_counts[label] = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM transactions")
+    total_live = cursor.fetchone()[0]
+
+    # Recent REQUIRE_HUMAN cases for the queue table
+    cursor.execute("""
+        SELECT transaction_id, sender_id, receiver_id, amount, risk_score, decision, reason, timestamp
+        FROM transactions
+        WHERE decision = 'REQUIRE_HUMAN'
+        ORDER BY timestamp DESC LIMIT 10
+    """)
+    pending_rows = cursor.fetchall()
+    pending_cases = [
+        {
+            "id": r["transaction_id"],
+            "sender": r["sender_id"],
+            "receiver": r["receiver_id"],
+            "amount": r["amount"],
+            "risk_score": r["risk_score"],
+            "decision": r["decision"],
+            "reason": r["reason"],
+            "timestamp": r["timestamp"],
+        }
+        for r in pending_rows
+    ]
+    conn.close()
+
+    # --- Batch review_queue.csv breakdown (run off the event loop) ---
+    topology_breakdown = []
+    review_queue_path = os.path.join(BASE_DIR, "data", "processed", "review_queue.csv")
+
+    def _compute_topology_breakdown(path: str):
+        import numpy as np
+        rq_df = pd.read_csv(path, usecols=["amount", "transactions_last_24hr", "Probability", "Actual", "fraud_scenario"])
+        prob     = rq_df["Probability"].fillna(0.5)
+        amount   = rq_df["amount"].fillna(500)
+        velocity = rq_df["transactions_last_24hr"].fillna(1)
+
+        # Vectorised elif chain — matches apply() logic exactly, ~100× faster
+        ai_decision = np.select(
+            [
+                (prob > 0.50) & (amount < 300)   & (velocity > 5),
+                (prob < 0.50) & (amount >= 100)  & (amount <= 3000) & (velocity < 4),
+                amount > 100000,
+                (prob > 0.60) & (amount >= 5000) & (amount <= 15000) & (velocity > 2),
+            ],
+            ["CONFIRMED_FRAUD", "AUTO_CLEARED_SAFE", "REQUIRE_HUMAN", "CONFIRMED_FRAUD"],
+            default="REQUIRE_HUMAN",
+        )
+        rq_df["AI_Decision"] = ai_decision
+        result = []
+        for topo in rq_df["fraud_scenario"].unique():
+            td = rq_df[rq_df["fraud_scenario"] == topo]
+            result.append({
+                "topology": str(topo),
+                "total_in_queue": int(len(td)),
+                "actual_fraud": int((td["Actual"] == 1).sum()),
+                "false_alarms_cleared": int(((td["AI_Decision"] == "AUTO_CLEARED_SAFE") & (td["Actual"] == 0)).sum()),
+                "fraud_caught": int(((td["AI_Decision"] == "CONFIRMED_FRAUD") & (td["Actual"] == 1)).sum()),
+                "sent_to_human": int((td["AI_Decision"] == "REQUIRE_HUMAN").sum()),
+            })
+        return result
+
+    if os.path.exists(review_queue_path):
+        try:
+            topology_breakdown = await asyncio.to_thread(_compute_topology_breakdown, review_queue_path)
+        except Exception as e:
+            print(f"WARNING: Could not parse review_queue.csv: {e}")
+
+    # --- Static rule definitions ---
+    rules = [
+        {
+            "id": 1,
+            "name": "Kamiti / M-Pesa Reversal Scam",
+            "condition": "Risk > 50%  AND  amount < 300  AND  velocity > 5",
+            "decision": "CONFIRMED_FRAUD",
+            "description": "Micro-transactions fired at high velocity — classic mass scam testing numbers. Auto-confirmed as fraud.",
+            "color": "red",
+        },
+        {
+            "id": 2,
+            "name": "Mama Mboga / Kiosk Normalcy Check",
+            "condition": "Risk < 50%  AND  100 ≤ amount ≤ 3,000  AND  velocity < 4",
+            "decision": "AUTO_CLEARED_SAFE",
+            "description": "Standard retail grocery payment with low velocity. AI clears the false alarm immediately.",
+            "color": "green",
+        },
+        {
+            "id": 3,
+            "name": "Wash-Wash / Real Estate Ring",
+            "condition": "amount > 100,000",
+            "decision": "REQUIRE_HUMAN",
+            "description": "High-value transfers exceed compliance threshold. AI is not authorised to clear — escalated to human analyst.",
+            "color": "yellow",
+        },
+        {
+            "id": 4,
+            "name": "Fuliza / Loan Siphon",
+            "condition": "Risk > 60%  AND  5,000 ≤ amount ≤ 15,000  AND  velocity > 2",
+            "decision": "CONFIRMED_FRAUD",
+            "description": "Amount perfectly matches a Fuliza credit-limit drain at suspicious velocity. Confirmed fraud.",
+            "color": "red",
+        },
+        {
+            "id": 5,
+            "name": "Auto-Freeze (Severe Topology)",
+            "condition": "Risk ≥ 85%",
+            "decision": "AUTO_FREEZE",
+            "description": "Extremely high model confidence — transaction frozen instantly before analyst review.",
+            "color": "purple",
+        },
+    ]
+
+    batch_totals = {
+        "fraud_caught": sum(r["fraud_caught"] for r in topology_breakdown),
+        "false_alarms_cleared": sum(r["false_alarms_cleared"] for r in topology_breakdown),
+        "sent_to_human": sum(r["sent_to_human"] for r in topology_breakdown),
+        "total_in_queue": sum(r["total_in_queue"] for r in topology_breakdown),
+    }
+
+    return {
+        "total_live_transactions": total_live,
+        "decision_counts": decision_counts,
+        "batch_totals": batch_totals,
+        "pending_cases": pending_cases,
+        "topology_breakdown": topology_breakdown,
+        "rules": rules,
+    }
+
+
 # RESOLVE ALERT ENDPOINT
 @app.post("/resolve-alert/{tx_id}")
 async def resolve_alert(tx_id: str, action: str = Query(...)):

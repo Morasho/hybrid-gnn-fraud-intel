@@ -115,6 +115,8 @@ PREDICT_GRAPH_CONTEXT_DEFAULTS = {
 
 # Load the trained Tier 1 inference artifacts
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Absolute path to SQLite DB — ensures correct location regardless of working directory (local or Railway)
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fraud_intel.db")
 MODEL_ARTIFACT_PATHS = {
     "stacked_hybrid": os.path.join(BASE_DIR, "models", "saved", "hybrid_xgboost.pkl"),
     "xgboost": os.path.join(BASE_DIR, "models", "saved", "baseline_xgboost.pkl"),
@@ -206,7 +208,7 @@ def fetch_predict_graph_context(sender_id: str, receiver_id: str, tx_id: str, am
 #  SQLITE DATABASE INITIALIZATION 
 def init_db():
     """Creates local SQLite tables to store dashboard transactions and uploaded datasets."""
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
@@ -465,7 +467,7 @@ def save_active_dataset(df: pd.DataFrame, source_name: str) -> dict[str, Any]:
     with open(ACTIVE_DATASET_META_PATH, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM uploaded_transactions")
     for _, row in df.iterrows():
@@ -887,7 +889,7 @@ def _insert_transaction_record(
     decision: str,
     reason: str,
 ) -> None:
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason)
@@ -906,7 +908,7 @@ def _watchlist_entity(entity_id: str, reason: str, increment_strike: bool = True
     does not already exist (used to silently tag downstream receivers).
     Returns the entity's NEW strike count.
     """
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     if increment_strike:
         conn.execute(
             """
@@ -936,7 +938,7 @@ def _watchlist_entity(entity_id: str, reason: str, increment_strike: bool = True
 
 def _get_watchlist_strikes(entity_id: str) -> int:
     """Return current watchlist strike count for an entity (0 if not on watchlist)."""
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute("SELECT strikes FROM watchlist WHERE entity_id = ?", (entity_id,))
     row = cursor.fetchone()
     conn.close()
@@ -944,7 +946,7 @@ def _get_watchlist_strikes(entity_id: str) -> int:
 
 
 def _blocklist_entity(entity_id: str, reason: str) -> None:
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
         INSERT OR IGNORE INTO blocklist (entity_id, added_on, reason)
@@ -958,7 +960,7 @@ def _blocklist_entity(entity_id: str, reason: str) -> None:
 
 def detect_recent_incoming(sender_id: str) -> bool:
     """Return True if sender_id received any non-blocked transaction in the last 5 minutes."""
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
         """
         SELECT 1 FROM transactions
@@ -976,7 +978,7 @@ def detect_recent_incoming(sender_id: str) -> bool:
 
 def get_downstream_receivers(sender_id: str) -> list[str]:
     """Return all distinct receivers this sender has successfully paid in the last 2 hours."""
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
         """
         SELECT DISTINCT receiver_id FROM transactions
@@ -1611,7 +1613,7 @@ async def predict_fraud(tx: TransactionRequest):
     4. Applies AI Analyst rules.
     """
     # 0. Layer 0 — Pre-Auth Blocklist check (fastest gate, runs before everything)
-    conn_bl = sqlite3.connect("fraud_intel.db")
+    conn_bl = sqlite3.connect(DB_PATH)
     cursor_bl = conn_bl.cursor()
     cursor_bl.execute(
         "SELECT reason FROM blocklist WHERE entity_id = ? OR entity_id = ? LIMIT 1",
@@ -1622,7 +1624,7 @@ async def predict_fraud(tx: TransactionRequest):
         conn_bl.close()
         block_reason = f"Entity on National Fraud Blocklist: {blocked[0]}"
         # Still persist the blocked attempt for audit trail
-        conn_audit = sqlite3.connect("fraud_intel.db")
+        conn_audit = sqlite3.connect(DB_PATH)
         conn_audit.execute(
             "INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (tx.transaction_id, datetime.now(), tx.sender_id, tx.receiver_id, tx.amount, 100.0, "TRANSACTION_BLOCKED", block_reason),
@@ -1641,7 +1643,7 @@ async def predict_fraud(tx: TransactionRequest):
     # ── Case 5: Rapid Reversal / Ping-Pong Fraud ─────────────────────────────
     # Detect if the current receiver (A) previously sent the SAME amount TO the
     # current sender (B) within 5 minutes — a symmetrical reversal.
-    conn_rev = sqlite3.connect("fraud_intel.db")
+    conn_rev = sqlite3.connect(DB_PATH)
     cursor_rev = conn_rev.cursor()
     cursor_rev.execute(
         """
@@ -1816,7 +1818,7 @@ async def predict_fraud(tx: TransactionRequest):
 @app.get("/dashboard-stats")
 async def get_dashboard_stats():
     """Endpoint for the Home dashboard to fetch real-time SQLite metrics."""
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -1930,7 +1932,7 @@ async def get_ai_analyst_summary():
     - The 4 Kenyan business rule definitions
     """
     # --- SQLite live decision counts ---
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
@@ -2125,7 +2127,7 @@ async def resolve_alert(tx_id: str, action: str = Query(...)):
     """Updates the transaction status in SQLite. On reject, adds the sender to the blocklist."""
     new_decision = "RESOLVED_SAFE" if action == "approve" else "RESOLVED_FRAUD"
 
-    conn = sqlite3.connect("fraud_intel.db")
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute("UPDATE transactions SET decision = ? WHERE transaction_id = ?", (new_decision, tx_id))
@@ -2201,7 +2203,7 @@ async def daraja_webhook(payload: DarajaCallback):
     # the warning, return ResultCode 2 to trigger the USSD warning screen.
     # If override_warning=True the user consciously chose to proceed.
     if not payload.override_warning:
-        conn_wl = sqlite3.connect("fraud_intel.db")
+        conn_wl = sqlite3.connect(DB_PATH)
         cursor_wl = conn_wl.cursor()
         cursor_wl.execute(
             "SELECT flag_reason, strikes FROM watchlist WHERE entity_id = ? LIMIT 1",
@@ -2228,7 +2230,7 @@ async def daraja_webhook(payload: DarajaCallback):
     # normal refresh cycles never trigger this gate.
     sim_swap_strike = 0
     if device_id:
-        conn_dev = sqlite3.connect("fraud_intel.db")
+        conn_dev = sqlite3.connect(DB_PATH)
         cursor_dev = conn_dev.cursor()
         cursor_dev.execute(
             """
@@ -2285,7 +2287,7 @@ async def daraja_webhook(payload: DarajaCallback):
 
     # Persist device_id on the transaction record for future shared-device lookups
     if device_id:
-        conn_upd = sqlite3.connect("fraud_intel.db")
+        conn_upd = sqlite3.connect(DB_PATH)
         conn_upd.execute(
             "UPDATE transactions SET device_id = ? WHERE transaction_id = ?",
             (device_id, internal_tx.transaction_id),
@@ -3242,7 +3244,7 @@ async def ai_explain_model(model_type: str, refresh: bool = False):
 async def ai_explain_transaction(tx_id: str, model: str = Query("stacked_hybrid")):
     """Return analyst-friendly transaction explanations for the selected model and transaction ID."""
     try:
-        conn = sqlite3.connect("fraud_intel.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             """

@@ -254,10 +254,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS watchlist (
             entity_id TEXT PRIMARY KEY,
             added_on DATETIME,
-            reason TEXT,
-            source_entity TEXT
+            flag_reason TEXT
         )
     """)
+    # Migrate existing watchlist schemas to include the required flag_reason column.
+    try:
+        cursor.execute("ALTER TABLE watchlist ADD COLUMN flag_reason TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # Backfill from legacy 'reason' column if this older schema exists.
+    try:
+        cursor.execute("UPDATE watchlist SET flag_reason = reason WHERE flag_reason IS NULL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -885,14 +894,14 @@ def _insert_transaction_record(
     conn.close()
 
 
-def _watchlist_entity(entity_id: str, reason: str, source_entity: str) -> None:
+def _watchlist_entity(entity_id: str, reason: str) -> None:
     conn = sqlite3.connect("fraud_intel.db")
     conn.execute(
         """
-        INSERT OR REPLACE INTO watchlist (entity_id, added_on, reason, source_entity)
-        VALUES (?, ?, ?, ?)
+        INSERT OR REPLACE INTO watchlist (entity_id, added_on, flag_reason)
+        VALUES (?, ?, ?)
         """,
-        (entity_id, datetime.now(), reason, source_entity),
+        (entity_id, datetime.now(), reason),
     )
     conn.commit()
     conn.close()
@@ -911,65 +920,35 @@ def _blocklist_entity(entity_id: str, reason: str) -> None:
     conn.close()
 
 
-def detect_fast_cashout_pattern(sender_id: str, receiver_id: str, amount: float) -> dict[str, Any] | None:
+def detect_funnel_disperse_pattern(sender_id: str) -> dict[str, Any] | None:
     """
-    Detect a mule-style fan-in then fan-out pattern:
-    - account receives money from 3+ unique senders in a short window
-    - then quickly forwards all/part of that money to other accounts
-    If detected, block the mule sender now and watchlist downstream accounts.
+    Detect AML Rapid Funnel & Disperse (Layering):
+    - CURRENT sender has recently received from >= 2 unique accounts
+    - within the last 15 minutes
+    - and is now sending out (this current tx)
     """
     conn = sqlite3.connect("fraud_intel.db")
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    accepted_placeholders = ", ".join("?" for _ in ACCEPTED_DECISIONS)
     cursor.execute(
-        f"""
+        """
         SELECT
-            COUNT(DISTINCT sender_id) AS unique_inbound_senders,
-            COALESCE(SUM(amount), 0) AS inbound_total,
-            COALESCE((julianday('now') - julianday(MAX(timestamp))) * 1440.0, 99999) AS minutes_since_last_inbound
+            COUNT(DISTINCT sender_id) AS unique_inbound_senders
         FROM transactions
         WHERE receiver_id = ?
-          AND decision IN ({accepted_placeholders})
-          AND datetime(timestamp) >= datetime('now', '-30 minutes')
+          AND decision != 'TRANSACTION_BLOCKED'
+          AND datetime(timestamp) >= datetime('now', '-15 minutes')
         """,
-        (sender_id, *ACCEPTED_DECISIONS),
+        (sender_id,),
     )
     inbound_stats = cursor.fetchone()
-
     unique_inbound_senders = int(inbound_stats["unique_inbound_senders"] or 0)
-    inbound_total = float(inbound_stats["inbound_total"] or 0.0)
-    minutes_since_last_inbound = float(inbound_stats["minutes_since_last_inbound"] or 99999.0)
-
-    if unique_inbound_senders < 3 or inbound_total <= 0 or minutes_since_last_inbound > 10:
-        conn.close()
-        return None
-
-    if amount < min(inbound_total * 0.25, inbound_total):
-        conn.close()
-        return None
-
-    cursor.execute(
-        f"""
-        SELECT DISTINCT receiver_id
-        FROM transactions
-        WHERE sender_id = ?
-          AND decision IN ({accepted_placeholders})
-          AND datetime(timestamp) >= datetime('now', '-30 minutes')
-        """,
-        (sender_id, *ACCEPTED_DECISIONS),
-    )
-    prior_downstream = {row["receiver_id"] for row in cursor.fetchall() if row["receiver_id"]}
     conn.close()
 
-    downstream_accounts = sorted(prior_downstream | {receiver_id})
-    return {
-        "unique_inbound_senders": unique_inbound_senders,
-        "inbound_total": inbound_total,
-        "minutes_since_last_inbound": round(minutes_since_last_inbound, 2),
-        "downstream_accounts": downstream_accounts,
-    }
+    if unique_inbound_senders >= 2:
+        return {"unique_inbound_senders": unique_inbound_senders}
+    return None
 
 
 def _parse_uploaded_sample_file(content: bytes, filename: str) -> pd.DataFrame:
@@ -1599,8 +1578,8 @@ async def predict_fraud(tx: TransactionRequest):
         (tx.sender_id, tx.receiver_id),
     )
     blocked = cursor_bl.fetchone()
-    conn_bl.close()
     if blocked:
+        conn_bl.close()
         block_reason = f"Entity on National Fraud Blocklist: {blocked[0]}"
         # Still persist the blocked attempt for audit trail
         conn_audit = sqlite3.connect("fraud_intel.db")
@@ -1617,50 +1596,12 @@ async def predict_fraud(tx: TransactionRequest):
             reason=block_reason,
         )
 
-    cursor_bl.execute(
-        "SELECT entity_id, reason, source_entity FROM watchlist WHERE entity_id = ? OR entity_id = ? LIMIT 1",
-        (tx.sender_id, tx.receiver_id),
-    )
+    # Layer 1 — Watchlist pre-check (sender only)
+    cursor_bl.execute("SELECT flag_reason FROM watchlist WHERE entity_id = ? LIMIT 1", (tx.sender_id,))
     watched = cursor_bl.fetchone()
 
-    fast_cashout_signal = detect_fast_cashout_pattern(tx.sender_id, tx.receiver_id, tx.amount)
-    if fast_cashout_signal:
-        mule_reason = (
-            "Fast cashout mule pattern detected: "
-            f"{fast_cashout_signal['unique_inbound_senders']} unique inbound senders in 30 minutes, "
-            f"latest cashout {fast_cashout_signal['minutes_since_last_inbound']} minutes after receipt."
-        )
-        _blocklist_entity(tx.sender_id, mule_reason)
-        for downstream_account in fast_cashout_signal["downstream_accounts"]:
-            if downstream_account != tx.sender_id:
-                _watchlist_entity(
-                    downstream_account,
-                    f"Downstream account linked to fast-cashout mule {tx.sender_id}",
-                    tx.sender_id,
-                )
-
-        conn_bl.close()
-        _insert_transaction_record(
-            tx.transaction_id,
-            tx.sender_id,
-            tx.receiver_id,
-            tx.amount,
-            99.0,
-            "TRANSACTION_BLOCKED",
-            mule_reason,
-        )
-        return PredictionResponse(
-            transaction_id=tx.transaction_id,
-            risk_score=0.99,
-            decision="TRANSACTION_BLOCKED",
-            reason=mule_reason,
-        )
-
     if watched:
-        watch_reason = (
-            f"Watchlist review triggered for {watched[0]}: {watched[1]}"
-            + (f" (linked to {watched[2]})" if watched[2] else "")
-        )
+        watch_reason = f"{watched[0]} WARNING: Entity is on the Watchlist"
         conn_bl.close()
         _insert_transaction_record(
             tx.transaction_id,
@@ -1733,6 +1674,31 @@ async def predict_fraud(tx: TransactionRequest):
     except Exception as e:
          print(f"ERROR: Hybrid prediction failed. Details: {str(e)}") 
          risk_score = 0.65 
+
+    # AML Trap — Rapid Funnel & Disperse (Layering)
+    # If this sender recently received from >= 2 unique senders (15 min),
+    # and is now sending out, freeze sender and watchlist receiver.
+    funnel_signal = detect_funnel_disperse_pattern(tx.sender_id)
+    if funnel_signal:
+        aml_reason = "CRITICAL AML FLAG: Rapid Funnel & Disperse pattern detected. Account frozen."
+        _blocklist_entity(tx.sender_id, aml_reason)
+        _watchlist_entity(tx.receiver_id, "Received funds from flagged funnel account")
+
+        _insert_transaction_record(
+            tx.transaction_id,
+            tx.sender_id,
+            tx.receiver_id,
+            tx.amount,
+            99.5,
+            "TRANSACTION_BLOCKED",
+            aml_reason,
+        )
+        return PredictionResponse(
+            transaction_id=tx.transaction_id,
+            risk_score=0.995,
+            decision="TRANSACTION_BLOCKED",
+            reason=aml_reason,
+        )
 
     # 4. Tier 2 AI Analyst Decision
     decision, reason = apply_ai_analyst(tx.amount, tx.transactions_last_24hr, risk_score)
@@ -1836,7 +1802,7 @@ async def get_dashboard_stats():
 
     cursor.execute(
         """
-        SELECT entity_id, added_on, reason, source_entity
+        SELECT entity_id, added_on, flag_reason
         FROM watchlist
         ORDER BY datetime(added_on) DESC
         LIMIT 10
@@ -1847,8 +1813,8 @@ async def get_dashboard_stats():
         {
             "entity_id": row["entity_id"],
             "added_on": row["added_on"],
-            "reason": row["reason"],
-            "source_entity": row["source_entity"],
+            "reason": row["flag_reason"],
+            "source_entity": None,
         }
         for row in watchlist_rows
     ]
@@ -1947,7 +1913,7 @@ async def get_ai_analyst_summary():
 
     cursor.execute(
         """
-        SELECT entity_id, added_on, reason, source_entity
+        SELECT entity_id, added_on, flag_reason
         FROM watchlist
         ORDER BY datetime(added_on) DESC
         LIMIT 10
@@ -1958,8 +1924,8 @@ async def get_ai_analyst_summary():
         {
             "entity_id": r["entity_id"],
             "added_on": r["added_on"],
-            "reason": r["reason"],
-            "source_entity": r["source_entity"],
+            "reason": r["flag_reason"],
+            "source_entity": None,
         }
         for r in watchlist_rows
     ]

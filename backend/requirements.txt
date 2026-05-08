@@ -11,3 +11,4 @@ six==1.17.0
 tzdata==2025.3
 networkx
 python-dotenv
+# torch is installed separately via nixpacks.toml using the CPU-only index to avoid 4GB CUDA build

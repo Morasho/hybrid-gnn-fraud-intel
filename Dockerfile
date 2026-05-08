@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -r backend/requirements.txt
 # Copy the full project (backend code + models/saved + data)
 COPY . .
 
+WORKDIR /app/backend
+
 EXPOSE 8000
 
-CMD ["sh", "-c", "cd backend && uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

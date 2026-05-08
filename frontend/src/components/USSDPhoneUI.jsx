@@ -567,6 +567,8 @@ export default function USSDPhoneUI({ prefill = null }) {
             placeholder="1 or 2"
           />
         );
+
+      case P.RESULT: {
         const blocked = result?.ResultCode !== 0;
         const accentColor = blocked ? '#ff4141' : '#00ff41';
         const borderColor = blocked ? '#7f1d1d' : '#14532d';

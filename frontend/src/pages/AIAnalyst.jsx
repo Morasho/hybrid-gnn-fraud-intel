@@ -15,7 +15,6 @@ import {
   AlertTriangle,
   Lock,
   RefreshCw,
-  Eye,
 } from 'lucide-react';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -216,20 +215,6 @@ export default function AIAnalyst() {
             icon={<ShieldCheck className="text-green-400" size={22} />}
             colorClass="border-green-700"
           />
-          <StatCard
-            label="Watchlist Accounts"
-            value={data.watchlist_count ?? 0}
-            sub="Downstream entities under review"
-            icon={<Eye className="text-amber-400" size={22} />}
-            colorClass="border-amber-700"
-          />
-          <StatCard
-            label="Blocked Accounts"
-            value={data.blocklist_count ?? 0}
-            sub="Layer 0 and cashout rule stops"
-            icon={<ShieldX className="text-red-400" size={22} />}
-            colorClass="border-red-700"
-          />
         </div>
       )}
 
@@ -375,91 +360,6 @@ export default function AIAnalyst() {
         )}
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        <div>
-          <h2 className="text-base font-bold mb-1 text-gray-900">Watchlist Review Surface</h2>
-          <p className="text-xs text-gray-600 mb-4">
-            Downstream accounts linked to suspicious fast-cashout chains. Their next transactions are routed for review.
-          </p>
-
-          {loading ? (
-            <div className="space-y-2">
-              {[...Array(3)].map((_, i) => (
-                <div key={i} className="bg-gray-800 rounded-lg h-14 animate-pulse" />
-              ))}
-            </div>
-          ) : data?.watchlist?.length === 0 ? (
-            <div className="bg-gray-800 border border-amber-700 rounded-xl p-8 text-center">
-              <CheckCircle2 className="text-amber-400 mx-auto mb-3" size={36} />
-              <p className="text-sm font-medium text-gray-300">No watchlisted accounts yet</p>
-              <p className="text-xs text-gray-500 mt-1">Run the mule fan-in then fan-out case to populate this list.</p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto rounded-xl border border-amber-700">
-              <table className="w-full text-sm">
-                <thead className="bg-amber-950/50 text-amber-200 text-xs uppercase">
-                  <tr>
-                    <th className="px-4 py-3 text-left">Entity</th>
-                    <th className="px-4 py-3 text-left">Linked From</th>
-                    <th className="px-4 py-3 text-left">Reason</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700">
-                  {data.watchlist.map((entry, index) => (
-                    <tr key={`${entry.entity_id}-${index}`} className="bg-gray-800 hover:bg-gray-750 transition">
-                      <td className="px-4 py-3 font-mono text-xs text-white">{entry.entity_id}</td>
-                      <td className="px-4 py-3 font-mono text-xs text-amber-300">{entry.source_entity || '—'}</td>
-                      <td className="px-4 py-3 text-xs text-gray-400">{entry.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        <div>
-          <h2 className="text-base font-bold mb-1 text-gray-900">Blocklist Enforcement Surface</h2>
-          <p className="text-xs text-gray-600 mb-4">
-            Entities fully blocked by the fraud engine and stopped before normal scoring continues.
-          </p>
-
-          {loading ? (
-            <div className="space-y-2">
-              {[...Array(3)].map((_, i) => (
-                <div key={i} className="bg-gray-800 rounded-lg h-14 animate-pulse" />
-              ))}
-            </div>
-          ) : data?.blocklist?.length === 0 ? (
-            <div className="bg-gray-800 border border-red-700 rounded-xl p-8 text-center">
-              <CheckCircle2 className="text-red-400 mx-auto mb-3" size={36} />
-              <p className="text-sm font-medium text-gray-300">No blocked entities yet</p>
-              <p className="text-xs text-gray-500 mt-1">Blocked mules and confirmed fraudsters will appear here.</p>
-            </div>
-          ) : (
-            <div className="overflow-x-auto rounded-xl border border-red-700">
-              <table className="w-full text-sm">
-                <thead className="bg-red-950/50 text-red-200 text-xs uppercase">
-                  <tr>
-                    <th className="px-4 py-3 text-left">Entity</th>
-                    <th className="px-4 py-3 text-left">Added On</th>
-                    <th className="px-4 py-3 text-left">Reason</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700">
-                  {data.blocklist.map((entry, index) => (
-                    <tr key={`${entry.entity_id}-${index}`} className="bg-gray-800 hover:bg-gray-750 transition">
-                      <td className="px-4 py-3 font-mono text-xs text-white">{entry.entity_id}</td>
-                      <td className="px-4 py-3 text-xs text-gray-400">{entry.added_on || '—'}</td>
-                      <td className="px-4 py-3 text-xs text-gray-400">{entry.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
     </div>
   );
 }

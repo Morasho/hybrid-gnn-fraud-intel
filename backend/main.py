@@ -2221,20 +2221,24 @@ async def daraja_webhook(payload: DarajaCallback):
             }
 
     # ── Shared Device Detection (Case Study 4 — Synthetic Loan Farm) ──────────
-    # If this device_id was previously used by a *different* sender, it signals
-    # a SIM-swap fraud pattern: same physical phone, new SIM card.
-    shared_device_blocked = False
+    # Progressive SIM-swap detection:
+    #   Strike 1 (1 prior distinct sender on this device)  → REQUIRE_HUMAN
+    #   Strike 2 (2+ prior distinct senders on this device) → TRANSACTION_BLOCKED
+    # Refreshing the browser generates a new device_id (useRef resets), so
+    # normal refresh cycles never trigger this gate.
+    sim_swap_strike = 0
     if device_id:
         conn_dev = sqlite3.connect("fraud_intel.db")
         cursor_dev = conn_dev.cursor()
         cursor_dev.execute(
-            "SELECT COUNT(*) FROM transactions WHERE device_id = ? AND sender_id != ? LIMIT 1",
+            """
+            SELECT COUNT(DISTINCT sender_id) FROM transactions
+            WHERE device_id = ? AND sender_id != ?
+            """,
             (device_id, sender_msisdn),
         )
-        shared_device_count = cursor_dev.fetchone()[0]
+        sim_swap_strike = int(cursor_dev.fetchone()[0] or 0)
         conn_dev.close()
-        if shared_device_count > 0:
-            shared_device_blocked = True
 
     # Map Daraja fields → internal TransactionRequest
     internal_tx = TransactionRequest(
@@ -2249,14 +2253,35 @@ async def daraja_webhook(payload: DarajaCallback):
     # Run through the full AI engine (blocklist → GNN → XGBoost → Analyst rules)
     response = await predict_fraud(internal_tx)
 
-    # Override: shared device fingerprint always triggers AUTO_FREEZE
-    if shared_device_blocked and response.decision not in {"TRANSACTION_BLOCKED"}:
-        response = PredictionResponse(
-            transaction_id=internal_tx.transaction_id,
-            risk_score=0.96,
-            decision="AUTO_FREEZE",
-            reason="Shared device fingerprint detected: SIM Swap fraud pattern (Synthetic Loan Farm).",
-        )
+    # Progressive override for SIM-swap (only if AI hasn't already blocked it)
+    if sim_swap_strike >= 1 and response.decision not in {"TRANSACTION_BLOCKED"}:
+        if sim_swap_strike == 1:
+            # Strike 1 — first new user on this device: flag for human review
+            swap_reason = (
+                "SIM Swap detected: this device was previously used by a different account. "
+                "Transaction flagged for review (Strike 1)."
+            )
+            _watchlist_entity(sender_msisdn, "SIM Swap — Strike 1: shared device fingerprint")
+            response = PredictionResponse(
+                transaction_id=internal_tx.transaction_id,
+                risk_score=0.72,
+                decision="REQUIRE_HUMAN",
+                reason=swap_reason,
+            )
+        else:
+            # Strike 2+ — repeated SIM swap: block outright
+            swap_reason = (
+                "CRITICAL: Repeated SIM Swap fraud pattern. "
+                f"This device has been used by {sim_swap_strike + 1} distinct accounts. "
+                "Transaction permanently blocked (Strike 2)."
+            )
+            _blocklist_entity(sender_msisdn, swap_reason)
+            response = PredictionResponse(
+                transaction_id=internal_tx.transaction_id,
+                risk_score=0.97,
+                decision="TRANSACTION_BLOCKED",
+                reason=swap_reason,
+            )
 
     # Persist device_id on the transaction record for future shared-device lookups
     if device_id:

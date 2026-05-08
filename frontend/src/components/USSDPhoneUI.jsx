@@ -3,21 +3,19 @@ import axios from 'axios';
 import { Signal, Wifi, Battery, ChevronDown, ChevronUp } from 'lucide-react';
 import API_BASE from '../lib/api';
 
-// ─── localStorage wallet helpers ─────────────────────────────────────────────
+// ─── localStorage helpers (balance only) ─────────────────────────────────────
+// device_id is NOT persisted — it lives in React useRef so it:
+//   • resets on every page refresh (new users start clean)
+//   • stays the same when "Swap SIM" is clicked (Case Study 4 trap still fires)
 const LS = {
-  getDeviceId() {
-    let id = localStorage.getItem('mpesa_device_id');
-    if (!id) {
-      id = 'device_' + Math.random().toString(36).substr(2, 9);
-      localStorage.setItem('mpesa_device_id', id);
-    }
-    return id;
+  // Balance is keyed per phone number so each account remembers its own history.
+  _key: (phone) => `mpesa_balance_${phone}`,
+  getBalance: (phone) => parseFloat(localStorage.getItem(`mpesa_balance_${phone}`) ?? '500000'),
+  setBalance: (phone, v) => localStorage.setItem(`mpesa_balance_${phone}`, String(v)),
+  creditBalance: (phone, amount) => {
+    const current = parseFloat(localStorage.getItem(`mpesa_balance_${phone}`) ?? '500000');
+    localStorage.setItem(`mpesa_balance_${phone}`, String(parseFloat((current + amount).toFixed(2))));
   },
-  getSenderId: () => localStorage.getItem('mpesa_sender_id') || null,
-  setSenderId: (v) => localStorage.setItem('mpesa_sender_id', v),
-  clearSenderId: () => localStorage.removeItem('mpesa_sender_id'),
-  getBalance: () => parseFloat(localStorage.getItem('mpesa_balance') ?? '500000'),
-  setBalance: (v) => localStorage.setItem('mpesa_balance', String(v)),
 };
 
 // ─── Phase constants ──────────────────────────────────────────────────────────
@@ -200,16 +198,17 @@ function DevPanel() {
 export default function USSDPhoneUI({ prefill = null }) {
   const [time] = useState(currentTime);
 
-  // Identity / wallet — bootstrapped from localStorage
-  const deviceId = useRef(LS.getDeviceId()).current;
-  const [senderId, setSenderIdState] = useState(LS.getSenderId());
-  const [balance, setBalance] = useState(LS.getBalance());
+  // device_id: random per page-load (useRef = no storage = resets on refresh).
+  // Swap SIM does NOT regenerate it — same ref value, new sender → backend flags it.
+  const deviceId = useRef('device_' + Math.random().toString(36).substr(2, 9)).current;
 
-  // State machine phase
-  const [phase, setPhase] = useState(() => {
-    if (prefill) return P.SEND_RECIPIENT;
-    return LS.getSenderId() ? P.MENU : P.LOGIN;
-  });
+  // sender_id: React state only (also cleared on refresh — simulates SIM ejection).
+  const [senderId, setSenderIdState] = useState(null);
+  // Balance starts at 0 until login tells us which phone to load for.
+  const [balance, setBalance] = useState(0);
+
+  // State machine phase — always start at LOGIN on refresh (no active SIM)
+  const [phase, setPhase] = useState(() => prefill ? P.SEND_RECIPIENT : P.LOGIN);
 
   // Input fields
   const [loginInput, setLoginInput] = useState('');
@@ -223,26 +222,32 @@ export default function USSDPhoneUI({ prefill = null }) {
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState(null);
 
-  // Refresh balance from localStorage when prefill changes (remount pattern)
+  // Load balance for prefill phone if provided
   useEffect(() => {
-    setBalance(LS.getBalance());
+    if (prefill?.phone) {
+      setBalance(LS.getBalance(prefill.phone));
+      setSenderIdState(prefill.phone);
+    }
   }, []);
 
   // ── Identity handlers ────────────────────────────────────────────────────
   const handleLogin = () => {
     const val = loginInput.trim();
     if (!val) { setError('!Please enter a phone number.'); return; }
-    LS.setSenderId(val);
+    // Load this account's persisted balance (defaults to 500,000 for new accounts)
+    const acctBalance = LS.getBalance(val);
     setSenderIdState(val);
+    setBalance(acctBalance);
     setLoginInput('');
     setError('');
     setPhase(P.MENU);
   };
 
   const handleSwapSIM = () => {
-    // Clear SIM identity but KEEP device_id — simulates scammer inserting new SIM
-    LS.clearSenderId();
+    // Keep device_id (same ref) but clear sender — new SIM, same physical phone.
+    // This is what triggers the shared-device AUTO_FREEZE in Case Study 4.
     setSenderIdState(null);
+    setBalance(0);
     setPhase(P.LOGIN);
     setLoginInput('');
     setError('');
@@ -295,11 +300,13 @@ export default function USSDPhoneUI({ prefill = null }) {
     try {
       const res = await axios.post(`${API_BASE}/daraja-webhook`, payload);
       const data = res.data;
-      // Double-entry ledger: deduct only on success
+      // Double-entry ledger: deduct sender, credit recipient — only on success
       if (data.ResultCode === 0) {
         const newBalance = parseFloat((balance - amt).toFixed(2));
-        LS.setBalance(newBalance);
+        LS.setBalance(senderId, newBalance);
         setBalance(newBalance);
+        // Credit the recipient's stored balance
+        LS.creditBalance(recipient.trim(), amt);
       }
       setResult(data);
     } catch {

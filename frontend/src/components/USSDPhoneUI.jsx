@@ -300,6 +300,20 @@ export default function USSDPhoneUI({ prefill = null }) {
     }
   }, []);
 
+  // Auto-refresh balance while the balance screen is open.
+  // This ensures that if another account sends money to this one while the
+  // balance screen is already visible, the figure updates within ~1.5 s.
+  useEffect(() => {
+    if (phase !== P.BALANCE || !senderId) return;
+    const refresh = () => {
+      const fresh = LS.getBalance(senderId);
+      setBalance(fresh);
+    };
+    refresh(); // immediate read when entering the screen
+    const timer = setInterval(refresh, 1500);
+    return () => clearInterval(timer);
+  }, [phase, senderId]);
+
   // ── Identity handlers ────────────────────────────────────────────────────
   const handleLogin = () => {
     const val = loginInput.trim();
@@ -352,7 +366,11 @@ export default function USSDPhoneUI({ prefill = null }) {
         return;
       }
       if (data.ResultCode === 0) {
-        const newBalance = LS.debitAndCredit(senderId, recipient.trim(), amt);
+        // Use payload values (not stale closure vars) so the ledger keys
+        // are exactly what was submitted to the backend.
+        const senderKey = senderId;
+        const recipientKey = payload.BillRefNumber;
+        const newBalance = LS.debitAndCredit(senderKey, recipientKey, amt);
         setBalance(newBalance);
       }
       setResult(data);

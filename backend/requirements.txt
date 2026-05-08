@@ -12,3 +12,4 @@ tzdata==2025.3
 networkx
 python-dotenv
 scikit-learn
+python-multipart

@@ -61,19 +61,6 @@ const LS = {
   },
 };
 
-// ─── Persistent device fingerprint ───────────────────────────────────────────
-// Generated once, stored in localStorage so it survives page refreshes.
-// Swap SIM keeps the same device_id — that is intentional: same physical
-// device but new SIM triggers the shared-device AUTO_FREEZE in Case Study 4.
-function getOrCreateDeviceId() {
-  const key = 'device_fingerprint';
-  let id = localStorage.getItem(key);
-  if (!id) {
-    id = 'device_' + Math.random().toString(36).substr(2, 9);
-    localStorage.setItem(key, id);
-  }
-  return id;
-}
 
 // ─── Phase constants ──────────────────────────────────────────────────────────
 const P = {
@@ -264,9 +251,10 @@ function DevPanel() {
 export default function USSDPhoneUI({ prefill = null }) {
   const [time] = useState(currentTime);
 
-  // device_id: Persisted in localStorage so it survives page refreshes.
+  // device_id: random per component mount (useRef = no cross-instance sharing).
+  // Two phone simulators on the same page each get their own ID.
   // Swap SIM does NOT regenerate it — same ref, new sender → backend flags it.
-  const deviceId = useRef(getOrCreateDeviceId()).current;
+  const deviceId = useRef('device_' + Math.random().toString(36).substr(2, 9)).current;
 
   // sender_id: React state only (also cleared on refresh — simulates SIM ejection).
   const [senderId, setSenderIdState] = useState(null);

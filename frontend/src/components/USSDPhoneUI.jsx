@@ -61,6 +61,20 @@ const LS = {
   },
 };
 
+// ─── Persistent device fingerprint ───────────────────────────────────────────
+// Generated once, stored in localStorage so it survives page refreshes.
+// Swap SIM keeps the same device_id — that is intentional: same physical
+// device but new SIM triggers the shared-device AUTO_FREEZE in Case Study 4.
+function getOrCreateDeviceId() {
+  const key = 'device_fingerprint';
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = 'device_' + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
+
 // ─── Phase constants ──────────────────────────────────────────────────────────
 const P = {
   LOGIN: 'LOGIN',
@@ -69,6 +83,7 @@ const P = {
   SEND_AMOUNT: 'SEND_AMOUNT',
   SEND_PIN: 'SEND_PIN',
   PROCESSING: 'PROCESSING',
+  WARN: 'WARN',
   RESULT: 'RESULT',
   BALANCE: 'BALANCE',
   UNAVAILABLE: 'UNAVAILABLE',
@@ -183,9 +198,13 @@ const CHEAT_CASES = [
   },
   {
     n: 2,
-    title: 'AML Funnel & Disperse',
-    steps: 'Step 1: Send Ksh 5,000 to 0799999999.\nStep 2: Swap SIM. Send Ksh 6,000 to 0799999999.\nStep 3: Swap SIM to 0799999999 (The Funnel). Check Balance (Option 5) to see the newly received funds (Ksh 511,000).\nStep 4: Try to send Ksh 10,000 to 0788888888.',
-    expected: 'AI will block the funnel and watchlist the receiver!',
+    title: 'Progressive AML Funnel (Alice)',
+    steps:
+      'Step 1: Send any amount to Alice (0712354702). Swap SIM → log in as Alice, send money out.\n' +
+      'Step 2: Repeat the full loop 2 more times (send to Alice → Alice sends out).\n' +
+      'Step 3: Swap back to any account, try to send money TO Alice → ⚠ WARNING friction screen fires.\n' +
+      'Step 4: Log in as Alice, try to send money once more → AI permanently blocks Alice & watchlists all her downstream accounts.',
+    expected: 'Strikes 1-3: silent watchlist. Strike 4 outgoing: permanent BLOCK + downstream watchlist.',
   },
   {
     n: 3,
@@ -201,9 +220,13 @@ const CHEAT_CASES = [
   },
   {
     n: 5,
-    title: 'Synthetic Loan Farm (Shared Device Trap)',
-    steps: 'Click "Swap SIM Card", enter a new fake phone number, send Ksh 10,000.',
-    expected: 'AI blocks — device_id matches previous user.',
+    title: 'Rapid Reversal / Ping-Pong Fraud',
+    steps:
+      'Step 1: Log in as A (0711000001), send Ksh 5,000 to B (0722000002).\n' +
+      'Step 2: Swap SIM → log in as B, send Ksh 5,000 BACK to A within 5 mins → BLOCKED, A watchlisted.\n' +
+      'Step 3: Swap SIM → log in as A, send Ksh 5,000 to C (0733000003).\n' +
+      'Step 4: Swap SIM → log in as C, send Ksh 5,000 back to A within 5 mins → A permanently BLOCKED.',
+    expected: 'Strike 1: reversal blocked, mastermind (A) watchlisted. Strike 2: A permanently blocklisted.',
   },
 ];
 
@@ -241,9 +264,9 @@ function DevPanel() {
 export default function USSDPhoneUI({ prefill = null }) {
   const [time] = useState(currentTime);
 
-  // device_id: random per page-load (useRef = no storage = resets on refresh).
-  // Swap SIM does NOT regenerate it — same ref value, new sender → backend flags it.
-  const deviceId = useRef('device_' + Math.random().toString(36).substr(2, 9)).current;
+  // device_id: Persisted in localStorage so it survives page refreshes.
+  // Swap SIM does NOT regenerate it — same ref, new sender → backend flags it.
+  const deviceId = useRef(getOrCreateDeviceId()).current;
 
   // sender_id: React state only (also cleared on refresh — simulates SIM ejection).
   const [senderId, setSenderIdState] = useState(null);
@@ -264,6 +287,9 @@ export default function USSDPhoneUI({ prefill = null }) {
   const [error, setError] = useState('');
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState(null);
+  // Friction-layer state (ResultCode 2 — watchlist warning)
+  const [warnInput, setWarnInput] = useState('');
+  const [pendingPayload, setPendingPayload] = useState(null);
 
   // Load balance for prefill phone if provided
   useEffect(() => {
@@ -312,6 +338,37 @@ export default function USSDPhoneUI({ prefill = null }) {
     else setError('!Invalid option. Enter 1–5.');
   };
 
+  // ── Core transaction submitter (shared by first attempt + override re-submit) ──
+  const _submitTransaction = async (payload) => {
+    const amt = parseFloat(payload.TransAmount);
+    try {
+      const res = await axios.post(`${API_BASE}/daraja-webhook`, payload);
+      const data = res.data;
+      if (data.ResultCode === 2) {
+        // Friction layer: backend returned a watchlist warning
+        setPendingPayload({ ...payload, override_warning: true });
+        setWarnInput('');
+        setPhase(P.WARN);
+        return;
+      }
+      if (data.ResultCode === 0) {
+        const newBalance = LS.debitAndCredit(senderId, recipient.trim(), amt);
+        setBalance(newBalance);
+      }
+      setResult(data);
+      setPhase(P.RESULT);
+    } catch {
+      setResult({
+        ResultCode: 1,
+        ResultDesc: 'Could not reach Fraud Intel backend. Is the server running?',
+        TransID: payload.TransID,
+        AIDecision: 'BACKEND_OFFLINE',
+        RiskScore: 0,
+      });
+      setPhase(P.RESULT);
+    }
+  };
+
   // ── Send Money flow ──────────────────────────────────────────────────────
   const handleRecipient = () => {
     if (!recipient.trim()) { setError('!Enter a recipient number.'); return; }
@@ -334,36 +391,32 @@ export default function USSDPhoneUI({ prefill = null }) {
     setPhase(P.PROCESSING);
     setSending(true);
 
-    const amt = parseFloat(amount);
-    const payload = {
+    const builtPayload = {
       TransID: txId(),
-      TransAmount: amt,
+      TransAmount: parseFloat(amount),
       MSISDN: senderId,
       BillRefNumber: recipient.trim(),
       TransTime: new Date().toISOString(),
-      device_id: deviceId,   // fingerprint for Case Study 4
+      device_id: deviceId,
     };
+    await _submitTransaction(builtPayload);
+    setSending(false);
+  };
 
-    try {
-      const res = await axios.post(`${API_BASE}/daraja-webhook`, payload);
-      const data = res.data;
-      // Double-entry ledger: deduct sender, credit recipient — only on success
-      if (data.ResultCode === 0) {
-        const newBalance = LS.debitAndCredit(senderId, recipient.trim(), amt);
-        setBalance(newBalance);
-      }
-      setResult(data);
-    } catch {
-      setResult({
-        ResultCode: 1,
-        ResultDesc: 'Could not reach Fraud Intel backend. Is the server running?',
-        TransID: payload.TransID,
-        AIDecision: 'BACKEND_OFFLINE',
-        RiskScore: 0,
-      });
-    } finally {
+  const handleWarnResponse = async () => {
+    const opt = warnInput.trim();
+    setWarnInput('');
+    if (opt === '1' && pendingPayload) {
+      // User confirmed — re-submit with override_warning: true
+      setPhase(P.PROCESSING);
+      setSending(true);
+      await _submitTransaction(pendingPayload);
+      setPendingPayload(null);
       setSending(false);
-      setPhase(P.RESULT);
+    } else if (opt === '2') {
+      // User cancelled
+      setPendingPayload(null);
+      backToMenu();
     }
   };
 
@@ -492,7 +545,28 @@ export default function USSDPhoneUI({ prefill = null }) {
       case P.PROCESSING:
         return <ProcessingScreen />;
 
-      case P.RESULT: {
+      case P.WARN:
+        return (
+          <USSDPanel
+            lines={[
+              '!⚠ WATCHLIST WARNING',
+              '',
+              `!Recipient ${recipient}`,
+              '!is under fraud investigation.',
+              '',
+              'Do you wish to proceed?',
+              '',
+              '1. Yes — Send anyway',
+              '2. No  — Cancel & go back',
+              '',
+            ]}
+            input={warnInput}
+            onInput={setWarnInput}
+            onSend={handleWarnResponse}
+            onBack={backToMenu}
+            placeholder="1 or 2"
+          />
+        );
         const blocked = result?.ResultCode !== 0;
         const accentColor = blocked ? '#ff4141' : '#00ff41';
         const borderColor = blocked ? '#7f1d1d' : '#14532d';

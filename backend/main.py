@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
+from pathlib import Path
 import asyncio, json
 
 # Load .env from project root (two levels up from this file)
@@ -217,9 +218,15 @@ def init_db():
             amount REAL,
             risk_score REAL,
             decision TEXT,
-            reason TEXT
+            reason TEXT,
+            device_id TEXT
         )
     """)
+    # Migrate: add device_id column to existing tables that pre-date this schema
+    try:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN device_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS uploaded_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,6 +250,28 @@ def init_db():
             reason    TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            entity_id   TEXT PRIMARY KEY,
+            added_on    DATETIME,
+            flag_reason TEXT,
+            strikes     INTEGER DEFAULT 0
+        )
+    """)
+    # Migrate existing watchlist schemas forward.
+    for _col_sql in [
+        "ALTER TABLE watchlist ADD COLUMN flag_reason TEXT",
+        "ALTER TABLE watchlist ADD COLUMN strikes INTEGER DEFAULT 0",
+    ]:
+        try:
+            cursor.execute(_col_sql)
+        except sqlite3.OperationalError:
+            pass
+    # Backfill from legacy 'reason' column if this older schema exists.
+    try:
+        cursor.execute("UPDATE watchlist SET flag_reason = reason WHERE flag_reason IS NULL")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -844,6 +873,122 @@ def apply_ai_analyst(amount: float, velocity: int, risk_score: float) -> tuple[s
         return "REQUIRE_HUMAN", "High-value compliance limit exceeded (Wash-Wash rule)."
     else:
         return "REQUIRE_HUMAN", "Ambiguous pattern. Manual review required."
+
+
+ACCEPTED_DECISIONS = ("AUTO_CLEARED_SAFE", "REQUIRE_HUMAN", "RESOLVED_SAFE")
+
+
+def _insert_transaction_record(
+    transaction_id: str,
+    sender_id: str,
+    receiver_id: str,
+    amount: float,
+    risk_score: float,
+    decision: str,
+    reason: str,
+) -> None:
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.execute(
+        """
+        INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (transaction_id, datetime.now(), sender_id, receiver_id, amount, risk_score, decision, reason),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _watchlist_entity(entity_id: str, reason: str, increment_strike: bool = True) -> int:
+    """Upsert entity into watchlist.
+    When increment_strike=True the strikes counter is incremented by 1 (used for progressive
+    AML / reversal tracking).  When False the entity is registered with strikes=0 only if it
+    does not already exist (used to silently tag downstream receivers).
+    Returns the entity's NEW strike count.
+    """
+    conn = sqlite3.connect("fraud_intel.db")
+    if increment_strike:
+        conn.execute(
+            """
+            INSERT INTO watchlist (entity_id, added_on, flag_reason, strikes)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(entity_id) DO UPDATE SET
+                strikes     = strikes + 1,
+                flag_reason = excluded.flag_reason,
+                added_on    = excluded.added_on
+            """,
+            (entity_id, datetime.now(), reason),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO watchlist (entity_id, added_on, flag_reason, strikes)
+            VALUES (?, ?, ?, 0)
+            """,
+            (entity_id, datetime.now(), reason),
+        )
+    conn.commit()
+    cursor = conn.execute("SELECT strikes FROM watchlist WHERE entity_id = ?", (entity_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def _get_watchlist_strikes(entity_id: str) -> int:
+    """Return current watchlist strike count for an entity (0 if not on watchlist)."""
+    conn = sqlite3.connect("fraud_intel.db")
+    cursor = conn.execute("SELECT strikes FROM watchlist WHERE entity_id = ?", (entity_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def _blocklist_entity(entity_id: str, reason: str) -> None:
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO blocklist (entity_id, added_on, reason)
+        VALUES (?, ?, ?)
+        """,
+        (entity_id, datetime.now(), reason),
+    )
+    conn.commit()
+    conn.close()
+
+
+def detect_recent_incoming(sender_id: str) -> bool:
+    """Return True if sender_id received any non-blocked transaction in the last 5 minutes."""
+    conn = sqlite3.connect("fraud_intel.db")
+    cursor = conn.execute(
+        """
+        SELECT 1 FROM transactions
+        WHERE receiver_id = ?
+          AND decision != 'TRANSACTION_BLOCKED'
+          AND datetime(timestamp) >= datetime('now', '-5 minutes')
+        LIMIT 1
+        """,
+        (sender_id,),
+    )
+    found = cursor.fetchone() is not None
+    conn.close()
+    return found
+
+
+def get_downstream_receivers(sender_id: str) -> list[str]:
+    """Return all distinct receivers this sender has successfully paid in the last 2 hours."""
+    conn = sqlite3.connect("fraud_intel.db")
+    cursor = conn.execute(
+        """
+        SELECT DISTINCT receiver_id FROM transactions
+        WHERE sender_id = ?
+          AND decision != 'TRANSACTION_BLOCKED'
+          AND datetime(timestamp) >= datetime('now', '-2 hours')
+        """,
+        (sender_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 def _parse_uploaded_sample_file(content: bytes, filename: str) -> pd.DataFrame:
@@ -1473,8 +1618,8 @@ async def predict_fraud(tx: TransactionRequest):
         (tx.sender_id, tx.receiver_id),
     )
     blocked = cursor_bl.fetchone()
-    conn_bl.close()
     if blocked:
+        conn_bl.close()
         block_reason = f"Entity on National Fraud Blocklist: {blocked[0]}"
         # Still persist the blocked attempt for audit trail
         conn_audit = sqlite3.connect("fraud_intel.db")
@@ -1490,6 +1635,94 @@ async def predict_fraud(tx: TransactionRequest):
             decision="TRANSACTION_BLOCKED",
             reason=block_reason,
         )
+
+    conn_bl.close()
+
+    # ── Case 5: Rapid Reversal / Ping-Pong Fraud ─────────────────────────────
+    # Detect if the current receiver (A) previously sent the SAME amount TO the
+    # current sender (B) within 5 minutes — a symmetrical reversal.
+    conn_rev = sqlite3.connect("fraud_intel.db")
+    cursor_rev = conn_rev.cursor()
+    cursor_rev.execute(
+        """
+        SELECT 1 FROM transactions
+        WHERE sender_id = ?
+          AND receiver_id = ?
+          AND amount = ?
+          AND decision != 'TRANSACTION_BLOCKED'
+          AND datetime(timestamp) >= datetime('now', '-5 minutes')
+        LIMIT 1
+        """,
+        (tx.receiver_id, tx.sender_id, tx.amount),
+    )
+    reversal_detected = cursor_rev.fetchone() is not None
+    conn_rev.close()
+
+    if reversal_detected:
+        initiator = tx.receiver_id  # A: the account that originated the scheme
+        existing_strikes = _get_watchlist_strikes(initiator)
+        reversal_block_reason = (
+            f"REVERSAL FRAUD BLOCKED: Symmetrical Ksh {tx.amount:,.0f} ping-pong "
+            f"detected between {tx.sender_id} and {tx.receiver_id} within 5 minutes."
+        )
+        if existing_strikes >= 1:
+            # Strike 2 — mastermind already on watchlist: permanently blocklist them
+            _blocklist_entity(
+                initiator,
+                "CRITICAL: Repeated Reversal Fraud. Behavioural fingerprint confirmed.",
+            )
+            reversal_block_reason += f" Mastermind {initiator} permanently BLOCKLISTED."
+        else:
+            # Strike 1 — first offence: silently watchlist the initiator
+            _watchlist_entity(initiator, "Suspicious Reversal Initiator")
+            reversal_block_reason += f" Initiator {initiator} added to Watchlist (Strike 1)."
+        _insert_transaction_record(
+            tx.transaction_id, tx.sender_id, tx.receiver_id, tx.amount,
+            98.0, "TRANSACTION_BLOCKED", reversal_block_reason,
+        )
+        return PredictionResponse(
+            transaction_id=tx.transaction_id,
+            risk_score=0.98,
+            decision="TRANSACTION_BLOCKED",
+            reason=reversal_block_reason,
+        )
+
+    # ── Case 2: Progressive AML Funnel & Disperse ────────────────────────────
+    # If the sender received funds within the last 5 minutes and is now pushing
+    # them out, this is a funnel event.  Track strikes progressively and
+    # escalate: watchlist (strikes 1-3), permanent block at strike 4.
+    if detect_recent_incoming(tx.sender_id):
+        current_strikes = _get_watchlist_strikes(tx.sender_id)
+        if current_strikes >= 3:
+            # Strike 4 → permanent block
+            aml_block_reason = (
+                "CRITICAL AML FLAG: Rapid Funnel & Disperse pattern detected. "
+                "Account permanently frozen after 4 confirmed rapid in-and-out cycles."
+            )
+            _blocklist_entity(tx.sender_id, aml_block_reason)
+            for downstream in get_downstream_receivers(tx.sender_id):
+                _watchlist_entity(
+                    downstream,
+                    "Received funds from confirmed AML funnel account",
+                    increment_strike=False,
+                )
+            _insert_transaction_record(
+                tx.transaction_id, tx.sender_id, tx.receiver_id, tx.amount,
+                99.5, "TRANSACTION_BLOCKED", aml_block_reason,
+            )
+            return PredictionResponse(
+                transaction_id=tx.transaction_id,
+                risk_score=0.995,
+                decision="TRANSACTION_BLOCKED",
+                reason=aml_block_reason,
+            )
+        else:
+            # Strikes 1-3: increment watchlist counter silently
+            new_strikes = _watchlist_entity(
+                tx.sender_id,
+                "Progressive AML Funnel: repeated rapid receive-then-send pattern",
+            )
+            print(f"AML WATCHLIST: {tx.sender_id} now has {new_strikes} funnel strike(s).")
 
     graph_context = PREDICT_GRAPH_CONTEXT_DEFAULTS.copy()
     try:
@@ -1550,14 +1783,15 @@ async def predict_fraud(tx: TransactionRequest):
     final_score_percentage = round(risk_score * 100, 1)
 
     #   SAVE TO SQLITE DATABASE
-    conn = sqlite3.connect("fraud_intel.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (tx.transaction_id, datetime.now(), tx.sender_id, tx.receiver_id, tx.amount, final_score_percentage, decision, reason))
-    conn.commit()
-    conn.close()
+    _insert_transaction_record(
+        tx.transaction_id,
+        tx.sender_id,
+        tx.receiver_id,
+        tx.amount,
+        final_score_percentage,
+        decision,
+        reason,
+    )
 
     if decision in ("CONFIRMED_FRAUD", "AUTO_FREEZE", "REQUIRE_HUMAN"):
       asyncio.create_task(push_alert("analyst_01", {
@@ -1623,20 +1857,67 @@ async def get_dashboard_stats():
             "status": "High" if "FRAUD" in r["decision"] or "FREEZE" in r["decision"] else "Medium"
         })
 
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, reason
+        FROM blocklist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    blocklist_rows = cursor.fetchall()
+    blocklist_entries = [
+        {
+            "entity_id": row["entity_id"],
+            "added_on": row["added_on"],
+            "reason": row["reason"],
+        }
+        for row in blocklist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM blocklist")
+    blocklist_count = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, flag_reason
+        FROM watchlist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    watchlist_rows = cursor.fetchall()
+    watchlist_entries = [
+        {
+            "entity_id": row["entity_id"],
+            "added_on": row["added_on"],
+            "reason": row["flag_reason"],
+            "source_entity": None,
+        }
+        for row in watchlist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM watchlist")
+    watchlist_count = cursor.fetchone()[0]
+
     conn.close()
 
     return {
         "kpis": {
             "total": total_tx,
             "fraud": fraud_tx,
-            "rate": round((fraud_tx / total_tx * 100), 1) if total_tx > 0 else 0
+            "rate": round((fraud_tx / total_tx * 100), 1) if total_tx > 0 else 0,
+            "watchlist": watchlist_count,
+            "blocklist": blocklist_count,
         },
         "pie": [
             {"name": "Low Risk", "value": low_risk, "color": "#10b981"},
             {"name": "Medium Risk", "value": medium_risk, "color": "#f59e0b"},
             {"name": "High Risk", "value": high_risk, "color": "#ef4444"}
         ],
-        "alerts": recent_alerts
+        "alerts": recent_alerts,
+        "watchlist": watchlist_entries,
+        "blocklist": blocklist_entries,
     }
     
 # AI ANALYST SUMMARY ENDPOINT
@@ -1686,6 +1967,49 @@ async def get_ai_analyst_summary():
         }
         for r in pending_rows
     ]
+
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, reason
+        FROM blocklist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    blocklist_rows = cursor.fetchall()
+    blocklist_entries = [
+        {
+            "entity_id": r["entity_id"],
+            "added_on": r["added_on"],
+            "reason": r["reason"],
+        }
+        for r in blocklist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM blocklist")
+    blocklist_count = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, flag_reason
+        FROM watchlist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    watchlist_rows = cursor.fetchall()
+    watchlist_entries = [
+        {
+            "entity_id": r["entity_id"],
+            "added_on": r["added_on"],
+            "reason": r["flag_reason"],
+            "source_entity": None,
+        }
+        for r in watchlist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM watchlist")
+    watchlist_count = cursor.fetchone()[0]
     conn.close()
 
     # --- Batch review_queue.csv breakdown (run off the event loop) ---
@@ -1786,6 +2110,10 @@ async def get_ai_analyst_summary():
         "decision_counts": decision_counts,
         "batch_totals": batch_totals,
         "pending_cases": pending_cases,
+        "watchlist_count": watchlist_count,
+        "blocklist_count": blocklist_count,
+        "watchlist": watchlist_entries,
+        "blocklist": blocklist_entries,
         "topology_breakdown": topology_breakdown,
         "rules": rules,
     }
@@ -1832,6 +2160,8 @@ class DarajaCallback(BaseModel):
     TransTime: Optional[str] = None
     BusinessShortCode: Optional[str] = None
     FirstName: Optional[str] = None
+    device_id: Optional[str] = None        # simulator device fingerprint (Case Study 4)
+    override_warning: Optional[bool] = False  # user acknowledged watchlist warning
 
 
 def _normalise_msisdn(msisdn: str) -> str:
@@ -1863,12 +2193,54 @@ async def daraja_webhook(payload: DarajaCallback):
             )
 
     sender_msisdn = _normalise_msisdn(payload.MSISDN)
+    receiver_id_raw = str(payload.BillRefNumber).strip()
+    device_id = (payload.device_id or "").strip() or None
+
+    # ── Pre-Check 2: Receiver Watchlist Warning (Friction Layer) ──────────────
+    # If the recipient is on the watchlist AND the sender has NOT acknowledged
+    # the warning, return ResultCode 2 to trigger the USSD warning screen.
+    # If override_warning=True the user consciously chose to proceed.
+    if not payload.override_warning:
+        conn_wl = sqlite3.connect("fraud_intel.db")
+        cursor_wl = conn_wl.cursor()
+        cursor_wl.execute(
+            "SELECT flag_reason, strikes FROM watchlist WHERE entity_id = ? LIMIT 1",
+            (receiver_id_raw,),
+        )
+        wl_row = cursor_wl.fetchone()
+        conn_wl.close()
+        if wl_row:
+            return {
+                "ResultCode": 2,
+                "ResultDesc": "WARNING: This account is under fraudulent watch.",
+                "TransID": payload.TransID,
+                "AIDecision": "WATCHLIST_WARNING",
+                "RiskScore": 50.0,
+                "Reason": f"{wl_row[0]} (Strikes: {wl_row[1]})",
+                "WarnMessage": "WARNING: This account is under fraudulent watch. Do you wish to proceed?",
+            }
+
+    # ── Shared Device Detection (Case Study 4 — Synthetic Loan Farm) ──────────
+    # If this device_id was previously used by a *different* sender, it signals
+    # a SIM-swap fraud pattern: same physical phone, new SIM card.
+    shared_device_blocked = False
+    if device_id:
+        conn_dev = sqlite3.connect("fraud_intel.db")
+        cursor_dev = conn_dev.cursor()
+        cursor_dev.execute(
+            "SELECT COUNT(*) FROM transactions WHERE device_id = ? AND sender_id != ? LIMIT 1",
+            (device_id, sender_msisdn),
+        )
+        shared_device_count = cursor_dev.fetchone()[0]
+        conn_dev.close()
+        if shared_device_count > 0:
+            shared_device_blocked = True
 
     # Map Daraja fields → internal TransactionRequest
     internal_tx = TransactionRequest(
         transaction_id=payload.TransID,
         sender_id=sender_msisdn,
-        receiver_id=str(payload.BillRefNumber),
+        receiver_id=receiver_id_raw,
         amount=payload.TransAmount,
         transactions_last_24hr=1,   # Daraja doesn't supply velocity; use safe default
         hour=datetime.now().hour,
@@ -1876,6 +2248,25 @@ async def daraja_webhook(payload: DarajaCallback):
 
     # Run through the full AI engine (blocklist → GNN → XGBoost → Analyst rules)
     response = await predict_fraud(internal_tx)
+
+    # Override: shared device fingerprint always triggers AUTO_FREEZE
+    if shared_device_blocked and response.decision not in {"TRANSACTION_BLOCKED"}:
+        response = PredictionResponse(
+            transaction_id=internal_tx.transaction_id,
+            risk_score=0.96,
+            decision="AUTO_FREEZE",
+            reason="Shared device fingerprint detected: SIM Swap fraud pattern (Synthetic Loan Farm).",
+        )
+
+    # Persist device_id on the transaction record for future shared-device lookups
+    if device_id:
+        conn_upd = sqlite3.connect("fraud_intel.db")
+        conn_upd.execute(
+            "UPDATE transactions SET device_id = ? WHERE transaction_id = ?",
+            (device_id, internal_tx.transaction_id),
+        )
+        conn_upd.commit()
+        conn_upd.close()
 
     # Map AI decision to Daraja ResultCode
     blocked_decisions = {"TRANSACTION_BLOCKED", "AUTO_FREEZE", "CONFIRMED_FRAUD"}

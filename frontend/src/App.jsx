@@ -9,6 +9,7 @@ import Alerts from './pages/Alerts';
 import Models from './pages/Models';
 import AIBot from './pages/AIBot';
 import AIAnalyst from './pages/AIAnalyst';
+import WatchAndBlock from './pages/WatchAndBlock';
 import USSDSimulator from './pages/USSDSimulator';
 import StandaloneMobile from './pages/StandaloneMobile';
 import Reports from './pages/Reports';
@@ -36,6 +37,7 @@ function App() {
                   <Route path="/models" element={<Models />} />
                   <Route path="/ai-bot" element={<AIBot />} />
                   <Route path="/ai-analyst" element={<AIAnalyst />} />
+                  <Route path="/watch-block" element={<WatchAndBlock />} />
                   <Route path="/ussd-sim" element={<USSDSimulator />} />
                   <Route path="/reports" element={<Reports />} />
                   <Route path="/settings" element={<Settings />} />

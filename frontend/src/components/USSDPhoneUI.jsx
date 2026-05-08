@@ -3,18 +3,61 @@ import axios from 'axios';
 import { Signal, Wifi, Battery, ChevronDown, ChevronUp } from 'lucide-react';
 import API_BASE from '../lib/api';
 
-// ─── localStorage helpers (balance only) ─────────────────────────────────────
+// ─── localStorage helpers (double-entry wallet ledger) ──────────────────────
 // device_id is NOT persisted — it lives in React useRef so it:
 //   • resets on every page refresh (new users start clean)
 //   • stays the same when "Swap SIM" is clicked (Case Study 4 trap still fires)
 const LS = {
-  // Balance is keyed per phone number so each account remembers its own history.
-  _key: (phone) => `mpesa_balance_${phone}`,
-  getBalance: (phone) => parseFloat(localStorage.getItem(`mpesa_balance_${phone}`) ?? '500000'),
-  setBalance: (phone, v) => localStorage.setItem(`mpesa_balance_${phone}`, String(v)),
-  creditBalance: (phone, amount) => {
-    const current = parseFloat(localStorage.getItem(`mpesa_balance_${phone}`) ?? '500000');
-    localStorage.setItem(`mpesa_balance_${phone}`, String(parseFloat((current + amount).toFixed(2))));
+  LEDGER_KEY: 'wallet_balances',
+  DEFAULT_BALANCE: 500000,
+  _readLedger: () => {
+    try {
+      const raw = localStorage.getItem('wallet_balances');
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  },
+  _writeLedger: (ledger) => {
+    localStorage.setItem('wallet_balances', JSON.stringify(ledger));
+  },
+  ensureWallet: (phone) => {
+    const key = String(phone || '').trim();
+    if (!key) return LS.DEFAULT_BALANCE;
+    const ledger = LS._readLedger();
+    if (typeof ledger[key] !== 'number' || Number.isNaN(ledger[key])) {
+      ledger[key] = LS.DEFAULT_BALANCE;
+      LS._writeLedger(ledger);
+    }
+    return parseFloat(ledger[key].toFixed(2));
+  },
+  getBalance: (phone) => {
+    const key = String(phone || '').trim();
+    if (!key) return LS.DEFAULT_BALANCE;
+    return LS.ensureWallet(key);
+  },
+  debitAndCredit: (senderPhone, recipientPhone, amount) => {
+    const senderKey = String(senderPhone || '').trim();
+    const recipientKey = String(recipientPhone || '').trim();
+    const amt = parseFloat(amount || 0);
+    const ledger = LS._readLedger();
+
+    if (!senderKey || !recipientKey || Number.isNaN(amt) || amt <= 0) {
+      return LS.DEFAULT_BALANCE;
+    }
+
+    if (typeof ledger[senderKey] !== 'number' || Number.isNaN(ledger[senderKey])) {
+      ledger[senderKey] = LS.DEFAULT_BALANCE;
+    }
+    if (typeof ledger[recipientKey] !== 'number' || Number.isNaN(ledger[recipientKey])) {
+      ledger[recipientKey] = LS.DEFAULT_BALANCE;
+    }
+
+    ledger[senderKey] = parseFloat((ledger[senderKey] - amt).toFixed(2));
+    ledger[recipientKey] = parseFloat((ledger[recipientKey] + amt).toFixed(2));
+    LS._writeLedger(ledger);
+    return ledger[senderKey];
   },
 };
 
@@ -140,9 +183,9 @@ const CHEAT_CASES = [
   },
   {
     n: 2,
-    title: 'Fast Cashouts (Velocity)',
-    steps: 'Send Ksh 80,000 to 0799999999 three times in a row.',
-    expected: 'AI velocity rule catches the 3rd attempt.',
+    title: 'AML Funnel & Disperse',
+    steps: 'Step 1: Send Ksh 5,000 to 0799999999.\nStep 2: Swap SIM. Send Ksh 6,000 to 0799999999.\nStep 3: Swap SIM to 0799999999 (The Funnel). Check Balance (Option 5) to see the newly received funds (Ksh 511,000).\nStep 4: Try to send Ksh 10,000 to 0788888888.',
+    expected: 'AI will block the funnel and watchlist the receiver!',
   },
   {
     n: 3,
@@ -181,7 +224,7 @@ function DevPanel() {
           {CHEAT_CASES.map(c => (
             <div key={c.n} className="border border-gray-800 rounded-lg p-2 space-y-1">
               <div className="text-xs font-bold text-gray-300 font-mono">Case {c.n}: {c.title}</div>
-              <div className="text-xs text-gray-400 font-mono">↳ {c.steps}</div>
+              <div className="text-xs text-gray-400 font-mono whitespace-pre-line">↳ {c.steps}</div>
               <div className="text-xs text-green-700 font-mono">✓ {c.expected}</div>
             </div>
           ))}
@@ -225,8 +268,9 @@ export default function USSDPhoneUI({ prefill = null }) {
   // Load balance for prefill phone if provided
   useEffect(() => {
     if (prefill?.phone) {
-      setBalance(LS.getBalance(prefill.phone));
-      setSenderIdState(prefill.phone);
+      const normalizedPhone = prefill.phone.trim();
+      setBalance(LS.getBalance(normalizedPhone));
+      setSenderIdState(normalizedPhone);
     }
   }, []);
 
@@ -261,7 +305,10 @@ export default function USSDPhoneUI({ prefill = null }) {
     setError('');
     if (opt === '1') setPhase(P.SEND_RECIPIENT);
     else if (opt === '2' || opt === '3' || opt === '4') setPhase(P.UNAVAILABLE);
-    else if (opt === '5') setPhase(P.BALANCE);
+    else if (opt === '5') {
+      setBalance(LS.getBalance(senderId));
+      setPhase(P.BALANCE);
+    }
     else setError('!Invalid option. Enter 1–5.');
   };
 
@@ -302,11 +349,8 @@ export default function USSDPhoneUI({ prefill = null }) {
       const data = res.data;
       // Double-entry ledger: deduct sender, credit recipient — only on success
       if (data.ResultCode === 0) {
-        const newBalance = parseFloat((balance - amt).toFixed(2));
-        LS.setBalance(senderId, newBalance);
+        const newBalance = LS.debitAndCredit(senderId, recipient.trim(), amt);
         setBalance(newBalance);
-        // Credit the recipient's stored balance
-        LS.creditBalance(recipient.trim(), amt);
       }
       setResult(data);
     } catch {

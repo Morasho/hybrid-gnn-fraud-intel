@@ -250,6 +250,14 @@ def init_db():
             reason    TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            entity_id TEXT PRIMARY KEY,
+            added_on DATETIME,
+            reason TEXT,
+            source_entity TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -851,6 +859,117 @@ def apply_ai_analyst(amount: float, velocity: int, risk_score: float) -> tuple[s
         return "REQUIRE_HUMAN", "High-value compliance limit exceeded (Wash-Wash rule)."
     else:
         return "REQUIRE_HUMAN", "Ambiguous pattern. Manual review required."
+
+
+ACCEPTED_DECISIONS = ("AUTO_CLEARED_SAFE", "REQUIRE_HUMAN", "RESOLVED_SAFE")
+
+
+def _insert_transaction_record(
+    transaction_id: str,
+    sender_id: str,
+    receiver_id: str,
+    amount: float,
+    risk_score: float,
+    decision: str,
+    reason: str,
+) -> None:
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.execute(
+        """
+        INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (transaction_id, datetime.now(), sender_id, receiver_id, amount, risk_score, decision, reason),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _watchlist_entity(entity_id: str, reason: str, source_entity: str) -> None:
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO watchlist (entity_id, added_on, reason, source_entity)
+        VALUES (?, ?, ?, ?)
+        """,
+        (entity_id, datetime.now(), reason, source_entity),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _blocklist_entity(entity_id: str, reason: str) -> None:
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO blocklist (entity_id, added_on, reason)
+        VALUES (?, ?, ?)
+        """,
+        (entity_id, datetime.now(), reason),
+    )
+    conn.commit()
+    conn.close()
+
+
+def detect_fast_cashout_pattern(sender_id: str, receiver_id: str, amount: float) -> dict[str, Any] | None:
+    """
+    Detect a mule-style fan-in then fan-out pattern:
+    - account receives money from 3+ unique senders in a short window
+    - then quickly forwards all/part of that money to other accounts
+    If detected, block the mule sender now and watchlist downstream accounts.
+    """
+    conn = sqlite3.connect("fraud_intel.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    accepted_placeholders = ", ".join("?" for _ in ACCEPTED_DECISIONS)
+    cursor.execute(
+        f"""
+        SELECT
+            COUNT(DISTINCT sender_id) AS unique_inbound_senders,
+            COALESCE(SUM(amount), 0) AS inbound_total,
+            COALESCE((julianday('now') - julianday(MAX(timestamp))) * 1440.0, 99999) AS minutes_since_last_inbound
+        FROM transactions
+        WHERE receiver_id = ?
+          AND decision IN ({accepted_placeholders})
+          AND datetime(timestamp) >= datetime('now', '-30 minutes')
+        """,
+        (sender_id, *ACCEPTED_DECISIONS),
+    )
+    inbound_stats = cursor.fetchone()
+
+    unique_inbound_senders = int(inbound_stats["unique_inbound_senders"] or 0)
+    inbound_total = float(inbound_stats["inbound_total"] or 0.0)
+    minutes_since_last_inbound = float(inbound_stats["minutes_since_last_inbound"] or 99999.0)
+
+    if unique_inbound_senders < 3 or inbound_total <= 0 or minutes_since_last_inbound > 10:
+        conn.close()
+        return None
+
+    if amount < min(inbound_total * 0.25, inbound_total):
+        conn.close()
+        return None
+
+    cursor.execute(
+        f"""
+        SELECT DISTINCT receiver_id
+        FROM transactions
+        WHERE sender_id = ?
+          AND decision IN ({accepted_placeholders})
+          AND datetime(timestamp) >= datetime('now', '-30 minutes')
+        """,
+        (sender_id, *ACCEPTED_DECISIONS),
+    )
+    prior_downstream = {row["receiver_id"] for row in cursor.fetchall() if row["receiver_id"]}
+    conn.close()
+
+    downstream_accounts = sorted(prior_downstream | {receiver_id})
+    return {
+        "unique_inbound_senders": unique_inbound_senders,
+        "inbound_total": inbound_total,
+        "minutes_since_last_inbound": round(minutes_since_last_inbound, 2),
+        "downstream_accounts": downstream_accounts,
+    }
 
 
 def _parse_uploaded_sample_file(content: bytes, filename: str) -> pd.DataFrame:
@@ -1498,6 +1617,69 @@ async def predict_fraud(tx: TransactionRequest):
             reason=block_reason,
         )
 
+    cursor_bl.execute(
+        "SELECT entity_id, reason, source_entity FROM watchlist WHERE entity_id = ? OR entity_id = ? LIMIT 1",
+        (tx.sender_id, tx.receiver_id),
+    )
+    watched = cursor_bl.fetchone()
+
+    fast_cashout_signal = detect_fast_cashout_pattern(tx.sender_id, tx.receiver_id, tx.amount)
+    if fast_cashout_signal:
+        mule_reason = (
+            "Fast cashout mule pattern detected: "
+            f"{fast_cashout_signal['unique_inbound_senders']} unique inbound senders in 30 minutes, "
+            f"latest cashout {fast_cashout_signal['minutes_since_last_inbound']} minutes after receipt."
+        )
+        _blocklist_entity(tx.sender_id, mule_reason)
+        for downstream_account in fast_cashout_signal["downstream_accounts"]:
+            if downstream_account != tx.sender_id:
+                _watchlist_entity(
+                    downstream_account,
+                    f"Downstream account linked to fast-cashout mule {tx.sender_id}",
+                    tx.sender_id,
+                )
+
+        conn_bl.close()
+        _insert_transaction_record(
+            tx.transaction_id,
+            tx.sender_id,
+            tx.receiver_id,
+            tx.amount,
+            99.0,
+            "TRANSACTION_BLOCKED",
+            mule_reason,
+        )
+        return PredictionResponse(
+            transaction_id=tx.transaction_id,
+            risk_score=0.99,
+            decision="TRANSACTION_BLOCKED",
+            reason=mule_reason,
+        )
+
+    if watched:
+        watch_reason = (
+            f"Watchlist review triggered for {watched[0]}: {watched[1]}"
+            + (f" (linked to {watched[2]})" if watched[2] else "")
+        )
+        conn_bl.close()
+        _insert_transaction_record(
+            tx.transaction_id,
+            tx.sender_id,
+            tx.receiver_id,
+            tx.amount,
+            72.0,
+            "REQUIRE_HUMAN",
+            watch_reason,
+        )
+        return PredictionResponse(
+            transaction_id=tx.transaction_id,
+            risk_score=0.72,
+            decision="REQUIRE_HUMAN",
+            reason=watch_reason,
+        )
+
+    conn_bl.close()
+
     graph_context = PREDICT_GRAPH_CONTEXT_DEFAULTS.copy()
     try:
         graph_context.update(
@@ -1557,14 +1739,15 @@ async def predict_fraud(tx: TransactionRequest):
     final_score_percentage = round(risk_score * 100, 1)
 
     #   SAVE TO SQLITE DATABASE
-    conn = sqlite3.connect("fraud_intel.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO transactions (transaction_id, timestamp, sender_id, receiver_id, amount, risk_score, decision, reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (tx.transaction_id, datetime.now(), tx.sender_id, tx.receiver_id, tx.amount, final_score_percentage, decision, reason))
-    conn.commit()
-    conn.close()
+    _insert_transaction_record(
+        tx.transaction_id,
+        tx.sender_id,
+        tx.receiver_id,
+        tx.amount,
+        final_score_percentage,
+        decision,
+        reason,
+    )
 
     if decision in ("CONFIRMED_FRAUD", "AUTO_FREEZE", "REQUIRE_HUMAN"):
       asyncio.create_task(push_alert("analyst_01", {
@@ -1630,20 +1813,67 @@ async def get_dashboard_stats():
             "status": "High" if "FRAUD" in r["decision"] or "FREEZE" in r["decision"] else "Medium"
         })
 
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, reason
+        FROM blocklist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    blocklist_rows = cursor.fetchall()
+    blocklist_entries = [
+        {
+            "entity_id": row["entity_id"],
+            "added_on": row["added_on"],
+            "reason": row["reason"],
+        }
+        for row in blocklist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM blocklist")
+    blocklist_count = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, reason, source_entity
+        FROM watchlist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    watchlist_rows = cursor.fetchall()
+    watchlist_entries = [
+        {
+            "entity_id": row["entity_id"],
+            "added_on": row["added_on"],
+            "reason": row["reason"],
+            "source_entity": row["source_entity"],
+        }
+        for row in watchlist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM watchlist")
+    watchlist_count = cursor.fetchone()[0]
+
     conn.close()
 
     return {
         "kpis": {
             "total": total_tx,
             "fraud": fraud_tx,
-            "rate": round((fraud_tx / total_tx * 100), 1) if total_tx > 0 else 0
+            "rate": round((fraud_tx / total_tx * 100), 1) if total_tx > 0 else 0,
+            "watchlist": watchlist_count,
+            "blocklist": blocklist_count,
         },
         "pie": [
             {"name": "Low Risk", "value": low_risk, "color": "#10b981"},
             {"name": "Medium Risk", "value": medium_risk, "color": "#f59e0b"},
             {"name": "High Risk", "value": high_risk, "color": "#ef4444"}
         ],
-        "alerts": recent_alerts
+        "alerts": recent_alerts,
+        "watchlist": watchlist_entries,
+        "blocklist": blocklist_entries,
     }
     
 # AI ANALYST SUMMARY ENDPOINT
@@ -1693,6 +1923,49 @@ async def get_ai_analyst_summary():
         }
         for r in pending_rows
     ]
+
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, reason
+        FROM blocklist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    blocklist_rows = cursor.fetchall()
+    blocklist_entries = [
+        {
+            "entity_id": r["entity_id"],
+            "added_on": r["added_on"],
+            "reason": r["reason"],
+        }
+        for r in blocklist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM blocklist")
+    blocklist_count = cursor.fetchone()[0]
+
+    cursor.execute(
+        """
+        SELECT entity_id, added_on, reason, source_entity
+        FROM watchlist
+        ORDER BY datetime(added_on) DESC
+        LIMIT 10
+        """
+    )
+    watchlist_rows = cursor.fetchall()
+    watchlist_entries = [
+        {
+            "entity_id": r["entity_id"],
+            "added_on": r["added_on"],
+            "reason": r["reason"],
+            "source_entity": r["source_entity"],
+        }
+        for r in watchlist_rows
+    ]
+
+    cursor.execute("SELECT COUNT(*) FROM watchlist")
+    watchlist_count = cursor.fetchone()[0]
     conn.close()
 
     # --- Batch review_queue.csv breakdown (run off the event loop) ---
@@ -1793,6 +2066,10 @@ async def get_ai_analyst_summary():
         "decision_counts": decision_counts,
         "batch_totals": batch_totals,
         "pending_cases": pending_cases,
+        "watchlist_count": watchlist_count,
+        "blocklist_count": blocklist_count,
+        "watchlist": watchlist_entries,
+        "blocklist": blocklist_entries,
         "topology_breakdown": topology_breakdown,
         "rules": rules,
     }

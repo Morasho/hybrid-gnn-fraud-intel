@@ -2,13 +2,19 @@
 
 > A production-ready fraud detection platform for mobile money ecosystems combining Graph Neural Networks (GNNs), XGBoost, and AI-powered explanations for analyst-driven investigations.
 
-## User Access Levels
+---
 
-- 👤 **Common User / Mwananchi**  
-  https://hybrid-gnn-fraud-intel.netlify.app/mobile
+## 🚀 User Access Levels
 
-- 🕵️ **Fraud Analyst / Expert**  
-  https://hybrid-gnn-fraud-intel.netlify.app/
+### 👤 Common User / Mwananchi  
+https://hybrid-gnn-fraud-intel.netlify.app/mobile
+
+### 🕵️ Fraud Analyst / Expert  
+https://hybrid-gnn-fraud-intel.netlify.app/
+
+---
+
+## 🛠️ Tech Stack
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)

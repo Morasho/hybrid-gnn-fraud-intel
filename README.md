@@ -2,6 +2,14 @@
 
 > A production-ready fraud detection platform for mobile money ecosystems combining Graph Neural Networks (GNNs), XGBoost, and AI-powered explanations for analyst-driven investigations.
 
+## User Access Levels
+
+- 👤 **Common User / Mwananchi**  
+  https://hybrid-gnn-fraud-intel.netlify.app/mobile
+
+- 🕵️ **Fraud Analyst / Expert**  
+  https://hybrid-gnn-fraud-intel.netlify.app/
+
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.135%2B-green)
@@ -263,7 +271,8 @@ This creates:
 
 ### Access the System
 
-1. **Frontend**: Open [http://localhost:5173](http://localhost:5173)
+1. **Frontend**:open [http://localhost:5173](http://localhost:5173) (Local Dev)  
+or https://hybrid-gnn-fraud-intel.netlify.app/mobile (Mwananchi / Mobile Frontend)
 2. **API Docs**: Open [http://localhost:8000/docs](http://localhost:8000/docs)
 3. **Health Check**: Open [http://localhost:8000/health](http://localhost:8000/health)
 
